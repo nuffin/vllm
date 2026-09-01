@@ -29,6 +29,7 @@ from vllm.tokenizers import TokenizerLike
 from vllm.tracing import init_tracer
 from vllm.usage.usage_lib import UsageContext
 from vllm.v1.engine import EngineCoreRequest, PauseMode
+from vllm.v1.engine.core import DrainAdmission
 from vllm.v1.engine.core_client import EngineCoreClient
 from vllm.v1.engine.input_processor import InputProcessor
 from vllm.v1.engine.output_processor import OutputProcessor
@@ -273,10 +274,12 @@ class LLMEngine:
         n = params.n if isinstance(params, SamplingParams) else 1
 
         if n == 1:
-            # Make a new RequestState and queue.
             self.output_processor.add_request(request, prompt_text, None, 0)
-            # Add the request to EngineCore.
-            self.engine_core.add_request(request)
+            if self.engine_core.add_request(request) == DrainAdmission.DRAINING:
+                self.output_processor.abort_requests(
+                    [request.request_id], internal=True
+                )
+                raise RuntimeError("EngineCore is draining; request was not admitted")
             return req_id
 
         # Fan out child requests (for n>1).
@@ -287,12 +290,15 @@ class LLMEngine:
             child_request.request_id = request_id
             child_request.sampling_params = child_params
 
-            # Make a new RequestState and queue.
             self.output_processor.add_request(
                 child_request, prompt_text, parent_req, idx
             )
-            # Add the request to EngineCore.
-            self.engine_core.add_request(child_request)
+            if self.engine_core.add_request(child_request) == DrainAdmission.DRAINING:
+                admitted_request_ids = self.output_processor.abort_requests(
+                    [parent_req.request_id], internal=True
+                )
+                self.engine_core.abort_requests(admitted_request_ids)
+                raise RuntimeError("EngineCore is draining; request was not admitted")
 
         return req_id
 

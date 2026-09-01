@@ -10,6 +10,7 @@ from collections import defaultdict, deque
 from collections.abc import Callable, Generator, Sequence
 from concurrent.futures import Future
 from contextlib import ExitStack, contextmanager
+from dataclasses import dataclass
 from enum import IntEnum
 from functools import partial
 from inspect import isclass, signature
@@ -18,6 +19,7 @@ from multiprocessing.queues import Queue
 from typing import Any, TypeVar, cast, get_args
 
 import msgspec
+import torch
 import zmq
 
 import vllm.envs as envs
@@ -102,6 +104,51 @@ HANDSHAKE_TIMEOUT_MINS = 5
 _R = TypeVar("_R")  # Return type for collective_rpc
 
 
+class DrainState(IntEnum):
+    """Engine-core admission state for a coordinator-managed drain."""
+
+    ACCEPTING = 0
+    DRAINING = 1
+
+
+class DrainAdmission(IntEnum):
+    """Non-mutating disposition for an EngineCore admission attempt."""
+
+    ACCEPTED = 0
+    DRAINING = 1
+
+
+@dataclass(frozen=True)
+class DrainSnapshot:
+    """Instantaneous engine-core observation, not a device-idle proof.
+
+    ``device_free_memory_bytes`` and ``device_total_memory_bytes`` are a
+    read-only, local device-runtime observation. They are not a reservation,
+    a multi-rank aggregate, or evidence that memory is safe to reclaim.
+    """
+
+    state: DrainState
+    running_requests: int
+    waiting_requests: int
+    unfinished_requests: int
+    scheduler_has_work: bool
+    pending_async_or_connector_work: bool
+    kv_cache_usage: float
+    device_free_memory_bytes: int
+    device_total_memory_bytes: int
+
+    @property
+    def quiescent(self) -> bool:
+        return (
+            self.state == DrainState.DRAINING
+            and self.running_requests == 0
+            and self.waiting_requests == 0
+            and self.unfinished_requests == 0
+            and not self.scheduler_has_work
+            and not self.pending_async_or_connector_work
+        )
+
+
 class EngineCore:
     """Inner loop of vLLM's Engine."""
 
@@ -127,6 +174,7 @@ class EngineCore:
             )
 
         self.log_stats = log_stats
+        self._drain_state = DrainState.ACCEPTING
         # Opaque weight version supplied by the caller.
         self._weight_version = "default"
 
@@ -455,6 +503,9 @@ class EngineCore:
         `request_wave`: indicate which wave of requests this is expected to
         belong to in DP case
         """
+        if self._drain_state == DrainState.DRAINING:
+            return DrainAdmission.DRAINING
+
         # Validate the request_id type.
         if not isinstance(request.request_id, str):
             raise TypeError(
@@ -494,6 +545,40 @@ class EngineCore:
             # Immediately abort so the connector's request_finished hook runs
             # to free any pre-admission KV-transfer resources.
             self.abort_requests([request.request_id])
+        return DrainAdmission.ACCEPTED
+
+    def is_draining(self) -> bool:
+        return self._drain_state == DrainState.DRAINING
+
+    def begin_drain(self) -> None:
+        """Fence new admission while preserving existing running requests."""
+        self._drain_state = DrainState.DRAINING
+        self.scheduler.set_pause_state(PauseState.PAUSED_NEW)
+
+    def resume_admission(self) -> None:
+        """Resume admission after a coordinator-controlled drain."""
+        self._drain_state = DrainState.ACCEPTING
+        self.scheduler.set_pause_state(PauseState.UNPAUSED)
+
+    def get_drain_snapshot(self) -> DrainSnapshot:
+        """Return a read-only, instantaneous drain observation."""
+        running_requests, waiting_requests = self.scheduler.get_request_counts()
+        unfinished_requests = self.scheduler.get_num_unfinished_requests()
+        scheduler_has_work = self.scheduler.has_requests()
+        device_free_memory, device_total_memory = torch.accelerator.get_memory_info()
+        return DrainSnapshot(
+            state=self._drain_state,
+            running_requests=running_requests,
+            waiting_requests=waiting_requests,
+            unfinished_requests=unfinished_requests,
+            scheduler_has_work=scheduler_has_work,
+            pending_async_or_connector_work=(
+                scheduler_has_work and unfinished_requests == 0
+            ),
+            kv_cache_usage=self.scheduler.get_kv_cache_usage(),
+            device_free_memory_bytes=device_free_memory,
+            device_total_memory_bytes=device_total_memory,
+        )
 
     def abort_requests(self, request_ids: list[str]):
         """Abort requests from the scheduler."""
@@ -1548,7 +1633,8 @@ class EngineCoreProc(EngineCore):
             req, request_wave = request
             if self._reject_add_in_shutdown(req):
                 return
-            self.add_request(req, request_wave)
+            if self.add_request(req, request_wave) == DrainAdmission.DRAINING:
+                self._send_abort_outputs_to_client([req.request_id], req.client_index)
         elif request_type == EngineCoreRequestType.ABORT:
             self.abort_requests(request)
         elif request_type == EngineCoreRequestType.UTILITY:
@@ -1763,6 +1849,11 @@ class EngineCoreProc(EngineCore):
                     request: Any
                     if request_type == EngineCoreRequestType.ADD:
                         req: EngineCoreRequest = add_request_decoder.decode(data_frames)
+                        if self.is_draining():
+                            self._send_abort_outputs_to_client(
+                                [req.request_id], req.client_index
+                            )
+                            continue
                         try:
                             request = self.preprocess_add_request(req)
                         except MultiModalCacheMissError as e:

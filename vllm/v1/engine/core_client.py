@@ -48,7 +48,7 @@ from vllm.v1.engine import (
     UtilityOutput,
 )
 from vllm.v1.engine.coordinator import DPCoordinator
-from vllm.v1.engine.core import EngineCore, EngineCoreProc
+from vllm.v1.engine.core import DrainAdmission, EngineCore, EngineCoreProc
 from vllm.v1.engine.exceptions import EngineDeadError
 from vllm.v1.engine.tensor_ipc import TensorIpcSender
 from vllm.v1.engine.utils import (
@@ -147,7 +147,22 @@ class EngineCoreClient(ABC):
     def get_supported_tasks(self) -> tuple[SupportedTask, ...]:
         raise NotImplementedError
 
-    def add_request(self, request: EngineCoreRequest) -> None:
+    def add_request(self, request: EngineCoreRequest) -> DrainAdmission | None:
+        """Submit a request.
+
+        In-process clients return the EngineCore admission disposition.
+        Multiprocess clients return ``None`` because ADD is asynchronous; a
+        drain rejection is returned as a terminal aborted output for cleanup.
+        """
+        raise NotImplementedError
+
+    def begin_drain(self) -> None:
+        raise NotImplementedError
+
+    def resume_admission(self) -> None:
+        raise NotImplementedError
+
+    def get_drain_snapshot(self):
         raise NotImplementedError
 
     def profile(self, is_start: bool = True, profile_prefix: str | None = None) -> None:
@@ -240,6 +255,15 @@ class EngineCoreClient(ABC):
     async def add_request_async(self, request: EngineCoreRequest) -> None:
         raise NotImplementedError
 
+    async def begin_drain_async(self) -> None:
+        raise NotImplementedError
+
+    async def resume_admission_async(self) -> None:
+        raise NotImplementedError
+
+    async def get_drain_snapshot_async(self):
+        raise NotImplementedError
+
     async def profile_async(
         self, is_start: bool = True, profile_prefix: str | None = None
     ) -> None:
@@ -324,9 +348,20 @@ class InprocClient(EngineCoreClient):
     def get_supported_tasks(self) -> tuple[SupportedTask, ...]:
         return self.engine_core.get_supported_tasks()
 
-    def add_request(self, request: EngineCoreRequest) -> None:
+    def add_request(self, request: EngineCoreRequest) -> DrainAdmission:
+        if self.engine_core.is_draining():
+            return DrainAdmission.DRAINING
         req, request_wave = self.engine_core.preprocess_add_request(request)
-        self.engine_core.add_request(req, request_wave)
+        return self.engine_core.add_request(req, request_wave)
+
+    def begin_drain(self) -> None:
+        self.engine_core.begin_drain()
+
+    def resume_admission(self) -> None:
+        self.engine_core.resume_admission()
+
+    def get_drain_snapshot(self):
+        return self.engine_core.get_drain_snapshot()
 
     def abort_requests(self, request_ids: list[str]) -> None:
         if len(request_ids) > 0:
@@ -910,6 +945,15 @@ class SyncMPClient(MPClient):
             self.engines_running = True
         self._send_input(EngineCoreRequestType.ADD, request)
 
+    def begin_drain(self) -> None:
+        self.call_utility("begin_drain")
+
+    def resume_admission(self) -> None:
+        self.call_utility("resume_admission")
+
+    def get_drain_snapshot(self):
+        return self.call_utility("get_drain_snapshot")
+
     def abort_requests(self, request_ids: list[str]) -> None:
         if request_ids and not self.resources.engine_dead:
             self._send_input(EngineCoreRequestType.ABORT, request_ids)
@@ -1150,6 +1194,15 @@ class AsyncMPClient(MPClient):
         request.client_index = self.client_index
         await self._send_input(EngineCoreRequestType.ADD, request)
         self._ensure_output_queue_task()
+
+    async def begin_drain_async(self) -> None:
+        await self.call_utility_async("begin_drain")
+
+    async def resume_admission_async(self) -> None:
+        await self.call_utility_async("resume_admission")
+
+    async def get_drain_snapshot_async(self):
+        return await self.call_utility_async("get_drain_snapshot")
 
     async def abort_requests_async(self, request_ids: list[str]) -> None:
         if request_ids and not self.resources.engine_dead:
