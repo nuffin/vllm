@@ -243,6 +243,8 @@ class ModelConfig:
     graph and always execute the model in eager mode. If False, we will use
     CUDA graph and eager execution in hybrid for maximal performance and
     flexibility."""
+    private_wna16_residency_layer: int | None = Field(default=None, ge=0)
+    """Opt-in Qwen3 WNA16 private-dispatch layer. ``None`` disables it."""
     enable_return_routed_experts: bool = False
     """Whether to return routed experts."""
     return_sampling_mask: bool = False
@@ -930,6 +932,11 @@ class ModelConfig:
     @model_validator(mode="after")
     def validate_model_config_after(self: "ModelConfig") -> "ModelConfig":
         """Called after __post_init__"""
+        if self.private_wna16_residency_layer is not None:
+            raise ValueError(
+                "--private-wna16-residency-layer is experimental and unavailable: "
+                "CPU-to-GPU private WNA16 residency handoff is not implemented."
+            )
         if not isinstance(self.tokenizer, str):
             raise ValueError(
                 f"tokenizer must be a string, got "

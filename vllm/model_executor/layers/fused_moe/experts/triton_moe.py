@@ -249,6 +249,10 @@ class TritonExperts(LoRAExpertsMixin, mk.FusedMoEExpertsModular):
         workspace2: torch.Tensor,
         expert_tokens_meta: mk.ExpertTokensMetadata | None,
         apply_router_weight_on_input: bool,
+        w1_scale: torch.Tensor | None = None,
+        w2_scale: torch.Tensor | None = None,
+        w1_zp: torch.Tensor | None = None,
+        w2_zp: torch.Tensor | None = None,
     ):
         # Check constraints.
         if self.quant_config.use_int4_w4a16:
@@ -643,6 +647,10 @@ class TritonWNA16Experts(TritonExperts):
         workspace2: torch.Tensor,
         expert_tokens_meta: mk.ExpertTokensMetadata | None,
         apply_router_weight_on_input: bool,
+        w1_scale: torch.Tensor | None = None,
+        w2_scale: torch.Tensor | None = None,
+        w1_zp: torch.Tensor | None = None,
+        w2_zp: torch.Tensor | None = None,
     ):
         # Check constraints.
         if self.quant_config.use_int4_w4a16:
@@ -714,8 +722,8 @@ class TritonWNA16Experts(TritonExperts):
             hidden_states,
             w1,
             intermediate_cache1,
-            self.w1_scale,
-            self.quant_config.w1_zp,
+            self.w1_scale if w1_scale is None else w1_scale,
+            self.quant_config.w1_zp if w1_zp is None else w1_zp,
             None,  # topk_weights
             sorted_token_ids,
             expert_ids,
@@ -747,8 +755,8 @@ class TritonWNA16Experts(TritonExperts):
             qintermediate_cache2,
             w2,
             intermediate_cache3,
-            self.w2_scale,
-            self.quant_config.w2_zp,
+            self.w2_scale if w2_scale is None else w2_scale,
+            self.quant_config.w2_zp if w2_zp is None else w2_zp,
             topk_weights,
             sorted_token_ids,
             expert_ids,

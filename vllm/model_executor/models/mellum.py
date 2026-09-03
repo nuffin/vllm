@@ -166,7 +166,9 @@ class MellumDecoderLayer(Qwen3MoeDecoderLayer):
 
         if config.mlp_layer_types[layer_idx] == "sparse":
             self.mlp = Qwen3MoeSparseMoeBlock(
-                vllm_config=vllm_config, prefix=f"{prefix}.mlp"
+                vllm_config=vllm_config,
+                layer_id=layer_idx,
+                prefix=f"{prefix}.mlp",
             )
         else:
             self.mlp = Qwen3MoeMLP(

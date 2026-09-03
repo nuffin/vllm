@@ -6,7 +6,7 @@ import gc
 import os
 import time
 from collections.abc import Callable
-from contextlib import AbstractContextManager, contextmanager, nullcontext
+from contextlib import AbstractContextManager, contextmanager, nullcontext, suppress
 from datetime import timedelta
 from types import NoneType
 from typing import TYPE_CHECKING, Any
@@ -218,6 +218,8 @@ class Worker(WorkerBase):
         self.profiler_config = vllm_config.profiler_config
 
         self.use_v2_model_runner = vllm_config.use_v2_model_runner
+        self._private_wna16_residency_controller = None
+        self._private_wna16_provider_registration = None
 
         # Resolved lazily on first sleep/wake; persists worker-process state.
         self._sleep_mode_backend: SleepModeBackend | None = None
@@ -490,21 +492,47 @@ class Worker(WorkerBase):
     # FIXME(youkaichao & ywang96): Use TorchDispatchMode instead of memory pool
     # to hijack tensor allocation.
     def load_model(self, *, load_dummy_weights: bool = False) -> None:
-        with (
-            self._maybe_get_memory_pool_context(tag="weights"),
-            set_current_vllm_config(self.vllm_config),
-            # 20 MiB is the minimum PyTorch allows for max_split_size_mb.
-            self._scoped_allocator_max_split(max_split_size_mb=20),
-        ):
-            self.model_runner.load_model(load_dummy_weights=load_dummy_weights)
-
-        if self.vllm_config.weight_transfer_config is not None:
-            self.weight_transfer_engine = WeightTransferEngineFactory.create_engine(
-                self.vllm_config.weight_transfer_config,
-                self.vllm_config,
-                self.device,
-                self.model_runner.get_model(),
+        registration = None
+        controller = None
+        layer_id = self.vllm_config.model_config.private_wna16_residency_layer
+        if layer_id is not None:
+            if getattr(self, "_private_wna16_provider_registration", None) is not None:
+                raise RuntimeError(
+                    "private WNA16 residency is already registered for this worker"
+                )
+            from vllm.model_executor.layers.fused_moe.private_wna16_provider import (
+                PrivateWNA16ResidencyController,
+                register_private_wna16_provider_factory,
             )
+
+            controller = PrivateWNA16ResidencyController(layer_id)
+            registration = register_private_wna16_provider_factory(
+                controller.make_provider
+            )
+        try:
+            with (
+                self._maybe_get_memory_pool_context(tag="weights"),
+                set_current_vllm_config(self.vllm_config),
+                # 20 MiB is the minimum PyTorch allows for max_split_size_mb.
+                self._scoped_allocator_max_split(max_split_size_mb=20),
+            ):
+                self.model_runner.load_model(load_dummy_weights=load_dummy_weights)
+            if self.vllm_config.weight_transfer_config is not None:
+                self.weight_transfer_engine = WeightTransferEngineFactory.create_engine(
+                    self.vllm_config.weight_transfer_config,
+                    self.vllm_config,
+                    self.device,
+                    self.model_runner.get_model(),
+                )
+        except BaseException:
+            if registration is not None:
+                with suppress(BaseException):
+                    registration.close()
+            self._private_wna16_residency_controller = None
+            self._private_wna16_provider_registration = None
+            raise
+        self._private_wna16_residency_controller = controller
+        self._private_wna16_provider_registration = registration
 
     def update_config(self, overrides: dict[str, Any]) -> None:
         self.model_runner.update_config(overrides)
@@ -1430,6 +1458,24 @@ class Worker(WorkerBase):
             self.model_runner.reset_lora_state()
 
     def shutdown(self) -> None:
+        if getattr(self, "_shutdown_complete", False):
+            return
+
+        def shutdown_owned_resource(
+            attribute: str, shutdown_method: str
+        ) -> None:
+            resource = getattr(self, attribute, None)
+            if resource is None:
+                return
+            setattr(self, attribute, None)
+            try:
+                getattr(resource, shutdown_method)()
+            except BaseException:
+                setattr(self, attribute, resource)
+                raise
+
+        shutdown_owned_resource("_private_wna16_provider_registration", "close")
+        self._private_wna16_residency_controller = None
         gc.unfreeze()
 
         # has_kv_transfer_group can be None during interpreter shutdown.
@@ -1437,18 +1483,13 @@ class Worker(WorkerBase):
             ensure_kv_transfer_shutdown()
         if ensure_ec_transfer_shutdown is not None:
             ensure_ec_transfer_shutdown()
-        if self.profiler is not None:
-            self.profiler.shutdown()
-
-        if weight_transfer_engine := getattr(self, "weight_transfer_engine", None):
-            weight_transfer_engine.shutdown()
-
-        self.elastic_ep_executor.shutdown()
+        shutdown_owned_resource("profiler", "shutdown")
+        shutdown_owned_resource("weight_transfer_engine", "shutdown")
+        shutdown_owned_resource("elastic_ep_executor", "shutdown")
 
         # Release GPU resources held by the model runner so that memory
         # can be reclaimed when running in-process
-        if model_runner := getattr(self, "model_runner", None):
-            model_runner.shutdown()
+        shutdown_owned_resource("model_runner", "shutdown")
 
         # Release kept-alive cumem pools while the pluggable allocator wrappers
         # and callbacks are still alive, so MemPool teardown is not deferred to
@@ -1458,6 +1499,7 @@ class Worker(WorkerBase):
 
             if CuMemAllocator.instance is not None:
                 CuMemAllocator.instance.release_pools()
+        self._shutdown_complete = True
 
     def elastic_ep_execute(self, execute_method: str, *args, **kwargs):
         return self.elastic_ep_executor.execute(execute_method, *args, **kwargs)

@@ -597,6 +597,8 @@ class Phase4GpuResidencyAdapter:
         execution_mode: str = "eager",
         modular: bool = True,
         backend_supports_dynamic_map: bool = False,
+        private_dispatch_enabled: bool = False,
+        private_dispatch_layer_id: int | None = None,
     ) -> None:
         self.enabled = enabled
         self.model_family = model_family
@@ -604,6 +606,8 @@ class Phase4GpuResidencyAdapter:
         self.execution_mode = execution_mode
         self.modular = modular
         self.backend_supports_dynamic_map = backend_supports_dynamic_map
+        self.private_dispatch_enabled = private_dispatch_enabled
+        self.private_dispatch_layer_id = private_dispatch_layer_id
         self.unsupported_requests = 0
 
     def capability(self) -> Phase4Capability:
@@ -643,6 +647,8 @@ class Phase4GpuResidencyAdapter:
                 Phase4FailureCategory.UNSUPPORTED_DYNAMIC_MAP,
                 "backend lacks per-call dynamic map support",
             )
+        if self.private_dispatch_enabled:
+            return Phase4Capability(True, None, "private WNA16 dispatch enabled")
         return Phase4Capability(
             False,
             Phase4FailureCategory.UNSUPPORTED_DYNAMIC_MAP,
@@ -668,13 +674,23 @@ class Phase4GpuResidencyAdapter:
         layer_id: int | None = None,
     ) -> None:
         """Validate a complete private-slot view without dispatching CUDA."""
-        validate_wna16_generation_view(view, layer_id=layer_id)
         if not self.enabled:
+            validate_wna16_generation_view(view)
             self.unsupported_requests += 1
             raise Phase4UnsupportedError(
                 Phase4FailureCategory.UNSUPPORTED_DYNAMIC_MAP,
                 "private WNA16 ABI is disabled by default",
             )
+        expected_layer_id = (
+            self.private_dispatch_layer_id if layer_id is None else layer_id
+        )
+        if expected_layer_id is None:
+            self.unsupported_requests += 1
+            raise Phase4UnsupportedError(
+                Phase4FailureCategory.VALIDATION,
+                "private WNA16 dispatch requires a bound layer id",
+            )
+        validate_wna16_generation_view(view, layer_id=expected_layer_id)
         capability = self.capability()
         if not capability.supported:
             self.unsupported_requests += 1
@@ -1019,4 +1035,59 @@ def validate_wna16_generation_view(
         raise Phase4UnsupportedError(
             Phase4FailureCategory.STALE_LEASE,
             "generation or map_generation is stale",
+        )
+
+
+def validate_private_wna16_dispatch_inputs(
+    view: WNA16GenerationView,
+    *,
+    hidden_states: torch.Tensor,
+    topk_ids: torch.Tensor,
+    topk_weights: torch.Tensor,
+    global_num_experts: int,
+    layer_id: int,
+) -> None:
+    """Validate complete private-dispatch inputs before a Triton launch."""
+    validate_wna16_generation_view(view, layer_id=layer_id)
+    bundle = view.bundle
+    if global_num_experts != bundle.global_num_experts:
+        raise Phase4UnsupportedError(
+            Phase4FailureCategory.VALIDATION,
+            "private WNA16 global expert count mismatch",
+        )
+    tensors = (
+        bundle.w13, bundle.w2, bundle.w13_scale, bundle.w2_scale, view.slot_map,
+        topk_ids, topk_weights,
+    )
+    if (
+        hidden_states.device.type != "cuda"
+        or any(tensor.device != hidden_states.device for tensor in tensors)
+    ):
+        raise Phase4UnsupportedError(
+            Phase4FailureCategory.VALIDATION,
+            "private WNA16 dispatch requires tensors on one CUDA device",
+        )
+    if (
+        topk_ids.ndim != 2
+        or topk_weights.ndim != 2
+        or topk_ids.shape != topk_weights.shape
+        or topk_ids.dtype != torch.int32
+        or not topk_ids.is_contiguous()
+        or not topk_weights.is_contiguous()
+    ):
+        raise Phase4UnsupportedError(
+            Phase4FailureCategory.VALIDATION,
+            "private WNA16 router tensors must be contiguous rank-2 int32 IDs",
+        )
+    flattened_ids = topk_ids.reshape(-1)
+    if bool(((flattened_ids < 0) | (flattened_ids >= global_num_experts)).any()):
+        raise Phase4UnsupportedError(
+            Phase4FailureCategory.VALIDATION,
+            "private WNA16 router IDs are outside the global expert domain",
+        )
+    selected_slots = view.slot_map.index_select(0, flattened_ids.to(torch.long))
+    if bool((selected_slots == -1).any()):
+        raise Phase4UnsupportedError(
+            Phase4FailureCategory.VALIDATION,
+            "private WNA16 dispatch requires every routed expert to be resident",
         )

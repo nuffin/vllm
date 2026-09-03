@@ -626,6 +626,9 @@ class MoERunner(MoERunnerInterface):
                 topk_indices_dtype=self._quant_method.topk_indices_dtype,
                 input_ids=input_ids,
             )
+            generation_view = self.routed_experts.get_private_wna16_generation_view(
+                topk_ids=topk_ids, topk_weights=topk_weights
+            )
 
             fused_out = self.routed_experts.forward_modular(
                 x=hidden_states,
@@ -633,6 +636,7 @@ class MoERunner(MoERunnerInterface):
                 topk_ids=topk_ids,
                 shared_experts=self._shared_experts,
                 shared_experts_input=shared_experts_input,
+                generation_view=generation_view,
             )
 
         if shared_experts_overlapping:

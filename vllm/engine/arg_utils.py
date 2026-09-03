@@ -570,6 +570,9 @@ class EngineArgs:
     `ONLINE_QUANT_SHORTHAND_NAMES`."""
     allow_deprecated_quantization: bool = ModelConfig.allow_deprecated_quantization
     enforce_eager: bool = ModelConfig.enforce_eager
+    private_wna16_residency_layer: int | None = (
+        ModelConfig.private_wna16_residency_layer
+    )
     disable_custom_all_reduce: bool = ParallelConfig.disable_custom_all_reduce
     language_model_only: bool = MultiModalConfig.language_model_only
     limit_mm_per_prompt: dict[str, int | dict[str, int]] = get_field(
@@ -885,6 +888,10 @@ class EngineArgs:
             **model_kwargs["allow_deprecated_quantization"],
         )
         model_group.add_argument("--enforce-eager", **model_kwargs["enforce_eager"])
+        model_group.add_argument(
+            "--private-wna16-residency-layer",
+            **model_kwargs["private_wna16_residency_layer"],
+        )
         model_group.add_argument(
             "--enable-return-routed-experts",
             **model_kwargs["enable_return_routed_experts"],
@@ -1793,6 +1800,7 @@ class EngineArgs:
             quantization_config=self.quantization_config,
             allow_deprecated_quantization=self.allow_deprecated_quantization,
             enforce_eager=self.enforce_eager,
+            private_wna16_residency_layer=self.private_wna16_residency_layer,
             enable_return_routed_experts=self.enable_return_routed_experts,
             return_sampling_mask=self.return_sampling_mask,
             max_logprobs=self.max_logprobs,

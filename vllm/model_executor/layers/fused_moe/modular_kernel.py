@@ -1529,6 +1529,94 @@ class FusedMoEKernelModularImpl:
             shared_experts_input=shared_experts_input,
         )
 
+    def apply_private_wna16(
+        self,
+        hidden_states: torch.Tensor,
+        w1: torch.Tensor,
+        w2: torch.Tensor,
+        w1_scale: torch.Tensor,
+        w2_scale: torch.Tensor,
+        w1_zp: torch.Tensor | None,
+        w2_zp: torch.Tensor | None,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+        activation: MoEActivation,
+        global_num_experts: int,
+        slot_map: torch.Tensor,
+        apply_router_weight_on_input: bool,
+        shared_experts: SharedExperts | None = None,
+        shared_experts_input: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Run validated WNA16 private tensors without mutating layer state."""
+        output = torch.empty_like(hidden_states)
+        a1q, a1q_scale, expert_tokens_meta, prepared_ids, prepared_weights = (
+            self._prepare(
+                hidden_states,
+                topk_weights,
+                topk_ids,
+                global_num_experts,
+                None,
+                apply_router_weight_on_input,
+            )
+        )
+        local_num_experts = w1.shape[0]
+        _, num_tokens, intermediate_size, hidden_size, top_k = (
+            self.fused_experts.moe_problem_size(a1q, w1, w2, prepared_ids)
+        )
+        if num_tokens == 0:
+            return torch.empty_like(a1q, dtype=hidden_states.dtype)
+        workspace13, workspace2, fused_out = self._allocate_buffers(
+            hidden_states.dtype,
+            a1q.device,
+            num_tokens,
+            num_tokens,
+            intermediate_size,
+            hidden_size,
+            top_k,
+            global_num_experts,
+            local_num_experts,
+            expert_tokens_meta,
+            activation,
+        )
+        lora_ctx = getattr(self.fused_experts, "_lora_context", None)
+        if lora_ctx is not None:
+            lora_ctx.original_hidden_states = hidden_states
+        try:
+            self.fused_experts.apply(
+                output=fused_out,
+                hidden_states=a1q,
+                w1=w1,
+                w2=w2,
+                topk_weights=prepared_weights,
+                topk_ids=prepared_ids,
+                activation=activation,
+                global_num_experts=global_num_experts,
+                expert_map=slot_map,
+                a1q_scale=a1q_scale,
+                a2_scale=self.fused_experts.a2_scale,
+                workspace13=workspace13,
+                workspace2=workspace2,
+                expert_tokens_meta=expert_tokens_meta,
+                apply_router_weight_on_input=apply_router_weight_on_input,
+                w1_scale=w1_scale,
+                w2_scale=w2_scale,
+                w1_zp=w1_zp,
+                w2_zp=w2_zp,
+            )
+        finally:
+            if lora_ctx is not None:
+                lora_ctx.original_hidden_states = None
+        return self._finalize(
+            output,
+            fused_out,
+            hidden_states,
+            prepared_weights,
+            prepared_ids,
+            apply_router_weight_on_input,
+            shared_experts=shared_experts,
+            shared_experts_input=shared_experts_input,
+        )
+
 
 @final
 class FusedMoEKernelMonolithicImpl:
@@ -1738,6 +1826,43 @@ class FusedMoEKernel:
             activation=activation,
             global_num_experts=global_num_experts,
             expert_map=expert_map,
+            apply_router_weight_on_input=apply_router_weight_on_input,
+            shared_experts=shared_experts,
+            shared_experts_input=shared_experts_input,
+        )
+
+    def apply_private_wna16(
+        self,
+        hidden_states: torch.Tensor,
+        w1: torch.Tensor,
+        w2: torch.Tensor,
+        w1_scale: torch.Tensor,
+        w2_scale: torch.Tensor,
+        w1_zp: torch.Tensor | None,
+        w2_zp: torch.Tensor | None,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+        activation: MoEActivation,
+        global_num_experts: int,
+        slot_map: torch.Tensor,
+        apply_router_weight_on_input: bool,
+        shared_experts: SharedExperts | None = None,
+        shared_experts_input: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        assert isinstance(self.impl, FusedMoEKernelModularImpl)
+        return self.impl.apply_private_wna16(
+            hidden_states=hidden_states,
+            w1=w1,
+            w2=w2,
+            w1_scale=w1_scale,
+            w2_scale=w2_scale,
+            w1_zp=w1_zp,
+            w2_zp=w2_zp,
+            topk_weights=topk_weights,
+            topk_ids=topk_ids,
+            activation=activation,
+            global_num_experts=global_num_experts,
+            slot_map=slot_map,
             apply_router_weight_on_input=apply_router_weight_on_input,
             shared_experts=shared_experts,
             shared_experts_input=shared_experts_input,

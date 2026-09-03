@@ -21,6 +21,7 @@ from vllm.model_executor.layers.fused_moe.expert_residency import (
     Phase4GpuResidencyAdapter,
     Phase4UnsupportedError,
     WNA16GenerationView,
+    validate_private_wna16_dispatch_inputs,
 )
 from vllm.model_executor.layers.fused_moe.fused_moe_method_base import (
     FusedMoEMethodBase,
@@ -90,6 +91,9 @@ class RoutedExperts(PluggableLayer):
         super().__init__()
         # Opt-in only; the ordinary modular path remains unchanged.
         self._phase4_residency: Phase4GpuResidencyAdapter | None = None
+        self._private_wna16_generation_view_provider: (
+            Callable[..., WNA16GenerationView] | None
+        ) = None
         self.layer_name = layer_name
         self.moe_config = moe_config
         self.quant_config = quant_config
@@ -1277,10 +1281,36 @@ class RoutedExperts(PluggableLayer):
                     Phase4FailureCategory.UNSUPPORTED_DYNAMIC_MAP,
                     "generation_view requires a residency adapter",
                 )
+            if (
+                getattr(
+                    self.quant_method, "supports_private_wna16_dispatch", False
+                )
+                is not True
+            ):
+                raise Phase4UnsupportedError(
+                    Phase4FailureCategory.UNSUPPORTED_DYNAMIC_MAP,
+                    "generation_view requires the Triton WNA16 private "
+                    "dispatch contract",
+                )
+            layer_id = self._phase4_residency.private_dispatch_layer_id
+            assert layer_id is not None
             self._phase4_residency.validate_generation_view(generation_view)
-            raise Phase4UnsupportedError(
-                Phase4FailureCategory.UNSUPPORTED_DYNAMIC_MAP,
-                "private WNA16 operator dispatch is not implemented for this method",
+            validate_private_wna16_dispatch_inputs(
+                generation_view,
+                hidden_states=x,
+                topk_ids=topk_ids,
+                topk_weights=topk_weights,
+                global_num_experts=self.global_num_experts,
+                layer_id=layer_id,
+            )
+            return self.quant_method.apply(
+                layer=self,
+                x=x,
+                topk_weights=topk_weights,
+                topk_ids=topk_ids,
+                shared_experts=shared_experts,
+                shared_experts_input=shared_experts_input,
+                generation_view=generation_view,
             )
 
         # Modular kernels use pre-computed routing. The unimplemented Phase 4
@@ -1295,13 +1325,10 @@ class RoutedExperts(PluggableLayer):
                 "transient expert map requires a quantization method advertising "
                 "the WNA16 transient map contract",
             )
-        if self._phase4_residency is not None:
-            if transient_expert_map is None:
-                self._phase4_residency.validate_request(topk_ids, topk_weights)
-            else:
-                self._phase4_residency.validate_request(
-                    topk_ids, topk_weights, transient_expert_map
-                )
+        if self._phase4_residency is not None and transient_expert_map is not None:
+            self._phase4_residency.validate_request(
+                topk_ids, topk_weights, transient_expert_map
+            )
         elif transient_expert_map is not None:
             raise Phase4UnsupportedError(
                 Phase4FailureCategory.UNSUPPORTED_DYNAMIC_MAP,
@@ -1320,6 +1347,42 @@ class RoutedExperts(PluggableLayer):
         return self.quant_method.apply(
             **apply_kwargs,
         )
+
+    def set_private_wna16_generation_view_provider(
+        self,
+        provider: Callable[..., WNA16GenerationView],
+        *,
+        layer_id: int,
+    ) -> None:
+        """Bind the selected layer's controller-owned dynamic view provider."""
+        if (
+            self._phase4_residency is None
+            or self._phase4_residency.private_dispatch_layer_id != layer_id
+        ):
+            raise ValueError("private WNA16 provider layer is not selected")
+        if self._private_wna16_generation_view_provider is not None:
+            raise RuntimeError("private WNA16 provider is already bound")
+        self._private_wna16_generation_view_provider = provider
+
+    def get_private_wna16_generation_view(
+        self, *, topk_ids: torch.Tensor, topk_weights: torch.Tensor
+    ) -> WNA16GenerationView | None:
+        """Acquire the selected dispatch's current controller-owned view."""
+        provider = self._private_wna16_generation_view_provider
+        if provider is None:
+            if self._phase4_residency is not None:
+                raise Phase4UnsupportedError(
+                    Phase4FailureCategory.UNSUPPORTED_DYNAMIC_MAP,
+                    "private WNA16 dispatch has no bound controller provider",
+                )
+            return None
+        view = provider(topk_ids=topk_ids, topk_weights=topk_weights)
+        if view is None:
+            raise Phase4UnsupportedError(
+                Phase4FailureCategory.UNSUPPORTED_DYNAMIC_MAP,
+                "private WNA16 controller provider returned no generation view",
+            )
+        return view
 
     def forward_monolithic(
         self,

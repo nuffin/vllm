@@ -23,6 +23,7 @@ from vllm.model_executor.layers.fused_moe.expert_residency import (
     WNA16ExpertBundle,
     WNA16GenerationView,
     WNA16UseLease,
+    validate_private_wna16_dispatch_inputs,
     validate_wna16_generation_view,
 )
 
@@ -130,6 +131,45 @@ def test_wna16_private_view_is_default_off_even_when_structurally_valid():
     with pytest.raises(Phase4UnsupportedError, match="disabled by default") as error:
         adapter.validate_generation_view(private_view())
     assert error.value.category is Phase4FailureCategory.UNSUPPORTED_DYNAMIC_MAP
+
+
+def test_private_dispatch_rejects_cpu_inputs_before_kernel_dispatch():
+    with pytest.raises(Phase4UnsupportedError, match="one CUDA device") as error:
+        validate_private_wna16_dispatch_inputs(
+            private_view(),
+            hidden_states=torch.ones(1, 2),
+            topk_ids=torch.tensor([[0, 2]], dtype=torch.int32),
+            topk_weights=torch.ones(1, 2),
+            global_num_experts=4,
+            layer_id=3,
+        )
+    assert error.value.category is Phase4FailureCategory.VALIDATION
+
+
+def test_private_dispatch_requires_bound_layer_even_when_enabled():
+    adapter = Phase4GpuResidencyAdapter(
+        enabled=True,
+        model_family="Qwen3-30B-A3B",
+        quantization="WNA16",
+        backend_supports_dynamic_map=True,
+        private_dispatch_enabled=True,
+    )
+
+    with pytest.raises(Phase4UnsupportedError, match="bound layer id"):
+        adapter.validate_generation_view(private_view())
+
+
+def test_private_dispatch_accepts_explicit_bound_layer():
+    adapter = Phase4GpuResidencyAdapter(
+        enabled=True,
+        model_family="Qwen3-30B-A3B",
+        quantization="WNA16",
+        backend_supports_dynamic_map=True,
+        private_dispatch_enabled=True,
+        private_dispatch_layer_id=3,
+    )
+
+    adapter.validate_generation_view(private_view())
 
 
 @pytest.mark.parametrize(

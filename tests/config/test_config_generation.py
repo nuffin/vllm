@@ -1,9 +1,33 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import pytest
+from pydantic import ValidationError
 
 from vllm.engine.arg_utils import EngineArgs
 from vllm.model_executor.layers.quantization.quark.utils import deep_compare
+
+
+def test_private_wna16_residency_option_is_explicitly_unavailable():
+    engine_args = {
+        "model": "deepseek-ai/DeepSeek-V2-Lite",
+        "trust_remote_code": True,
+    }
+
+    config = EngineArgs(**engine_args).create_engine_config()
+    assert config.model_config.private_wna16_residency_layer is None
+
+    with pytest.raises(
+        ValidationError,
+        match=("--private-wna16-residency-layer is experimental and unavailable"),
+    ):
+        EngineArgs(
+            **engine_args, private_wna16_residency_layer=0
+        ).create_engine_config()
+
+    with pytest.raises(ValidationError, match="greater than or equal to 0"):
+        EngineArgs(
+            **engine_args, private_wna16_residency_layer=-1
+        ).create_engine_config()
 
 
 def test_cuda_empty_vs_unset_configs(monkeypatch: pytest.MonkeyPatch):

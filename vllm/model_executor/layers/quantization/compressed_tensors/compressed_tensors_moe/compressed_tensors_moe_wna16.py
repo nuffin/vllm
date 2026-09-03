@@ -22,6 +22,12 @@ from vllm.model_executor.layers.fused_moe.config import (
     FusedMoEConfig,
     FusedMoEQuantConfig,
 )
+from vllm.model_executor.layers.fused_moe.expert_residency import (
+    Phase4FailureCategory,
+    Phase4UnsupportedError,
+    WNA16GenerationView,
+    validate_private_wna16_dispatch_inputs,
+)
 from vllm.model_executor.layers.fused_moe.oracle.int_wna16 import (
     WNA16MoEBackend,
     convert_to_wna16_moe_kernel_format,
@@ -58,6 +64,7 @@ class CompressedTensorsWNA16MoEMethod(CompressedTensorsMoEMethod):
     # Explicit protocol marker for RoutedExperts' transient-map gate. The
     # apply path remains fail-closed until a backend implements the contract.
     supports_transient_expert_map = True
+    supports_private_wna16_dispatch = False
 
     def __init__(
         self,
@@ -117,6 +124,9 @@ class CompressedTensorsWNA16MoEMethod(CompressedTensorsMoEMethod):
             may_have_zp=not self.symmetric,
             may_have_bias=False,
             allow_tile_padding=not is_actorder,
+        )
+        self.supports_private_wna16_dispatch = (
+            self.wna16_backend == WNA16MoEBackend.TRITON
         )
 
         self.is_marlin = self.wna16_backend in [
@@ -663,9 +673,72 @@ class CompressedTensorsWNA16MoEMethod(CompressedTensorsMoEMethod):
         shared_experts: SharedExperts | None,
         shared_experts_input: torch.Tensor | None,
         transient_expert_map: torch.Tensor | None = None,
+        generation_view: WNA16GenerationView | None = None,
     ) -> torch.Tensor:
         assert not self.is_monolithic
         assert self.moe_kernel is not None
+        if generation_view is not None:
+            if transient_expert_map is not None:
+                raise Phase4UnsupportedError(
+                    Phase4FailureCategory.VALIDATION,
+                    "generation_view and transient_expert_map are mutually exclusive",
+                )
+            if self.wna16_backend != WNA16MoEBackend.TRITON:
+                raise Phase4UnsupportedError(
+                    Phase4FailureCategory.UNSUPPORTED_DYNAMIC_MAP,
+                    "private WNA16 dispatch requires the Triton backend",
+                )
+            if layer.use_ep:
+                raise Phase4UnsupportedError(
+                    Phase4FailureCategory.UNSUPPORTED_DYNAMIC_MAP,
+                    "private WNA16 dispatch does not support expert parallelism",
+                )
+            bundle = generation_view.bundle
+            if (
+                bundle.quant_type != f"W{self.num_bits}A16"
+                or bundle.num_bits != self.num_bits
+                or bundle.symmetric is not self.symmetric
+                or bundle.group_size != self.group_size
+                or bundle.group_size != 32
+                or self.actorder is not None
+                or bundle.act_order
+            ):
+                raise Phase4UnsupportedError(
+                    Phase4FailureCategory.VALIDATION,
+                    "private WNA16 bundle quantization does not match "
+                    "layer quantization",
+                )
+            validate_private_wna16_dispatch_inputs(
+                generation_view,
+                hidden_states=x,
+                topk_ids=topk_ids,
+                topk_weights=topk_weights,
+                global_num_experts=layer.global_num_experts,
+                layer_id=bundle.layer_id,
+            )
+            is_capturing = getattr(torch.cuda, "is_current_stream_capturing", None)
+            if is_capturing is not None and is_capturing():
+                raise Phase4UnsupportedError(
+                    Phase4FailureCategory.VALIDATION,
+                    "private WNA16 dispatch does not support CUDA graph capture",
+                )
+            return self.moe_kernel.apply_private_wna16(
+                x,
+                bundle.w13,
+                bundle.w2,
+                bundle.w13_scale,
+                bundle.w2_scale,
+                bundle.w13_zero,
+                bundle.w2_zero,
+                topk_weights,
+                topk_ids,
+                activation=layer.activation,
+                global_num_experts=layer.global_num_experts,
+                slot_map=generation_view.slot_map,
+                apply_router_weight_on_input=layer.apply_router_weight_on_input,
+                shared_experts=shared_experts,
+                shared_experts_input=shared_experts_input,
+            )
         if transient_expert_map is not None:
             raise RuntimeError(
                 "WNA16 transient expert map requires a proven backend contract"

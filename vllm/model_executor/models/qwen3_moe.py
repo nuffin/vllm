@@ -43,6 +43,12 @@ from vllm.logger import init_logger
 from vllm.model_executor.layers.activation import SiluAndMul
 from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.layers.fused_moe import FusedMoEFactory
+from vllm.model_executor.layers.fused_moe.expert_residency import (
+    Phase4GpuResidencyAdapter,
+)
+from vllm.model_executor.layers.fused_moe.private_wna16_provider import (
+    bind_private_wna16_generation_view_provider,
+)
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import (
     MergedColumnParallelLinear,
@@ -80,6 +86,36 @@ from .utils import (
 )
 
 logger = init_logger(__name__)
+
+
+def _validate_private_wna16_selection(
+    vllm_config: VllmConfig,
+    config: Any,
+    decoder_layer_type: type[torch.nn.Module],
+) -> int | None:
+    """Validate the exact private WNA16 selector before binding a layer."""
+    layer_id = vllm_config.model_config.private_wna16_residency_layer
+    if layer_id is None:
+        return None
+    if (
+        vllm_config.model_config.architecture != "Qwen3MoeForCausalLM"
+        or decoder_layer_type is not Qwen3MoeDecoderLayer
+        or getattr(config, "model_type", None) != "qwen3_moe"
+    ):
+        raise ValueError("private WNA16 dispatch requires Qwen3MoeForCausalLM")
+    if layer_id >= config.num_hidden_layers:
+        raise ValueError("private WNA16 dispatch layer is out of range")
+    sparse_layers = set(range(config.num_hidden_layers)) - set(
+        getattr(config, "mlp_only_layers", [])
+    )
+    sparse_step = getattr(config, "decoder_sparse_step", 1)
+    if (
+        layer_id not in sparse_layers
+        or getattr(config, "num_experts", 0) <= 0
+        or (layer_id + 1) % sparse_step
+    ):
+        raise ValueError("private WNA16 dispatch layer must be sparse")
+    return layer_id
 
 
 class Qwen3MoeMLP(nn.Module):
@@ -131,6 +167,7 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
     def __init__(
         self,
         vllm_config: VllmConfig,
+        layer_id: int,
         prefix: str = "",
         is_fused_checkpoint_transposed: bool = False,
     ):
@@ -211,6 +248,30 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
             is_sequence_parallel=self.is_sequence_parallel,
             is_fused_checkpoint_transposed=is_fused_checkpoint_transposed,
         )
+        private_layer = vllm_config.model_config.private_wna16_residency_layer
+        if private_layer == layer_id:
+            if not vllm_config.model_config.enforce_eager:
+                raise ValueError("private WNA16 dispatch requires enforce_eager=True")
+            routed_experts = self.experts.routed_experts
+            if routed_experts.use_ep:
+                raise ValueError("private WNA16 dispatch does not support EP")
+            if not getattr(
+                routed_experts.quant_method, "supports_private_wna16_dispatch", False
+            ):
+                raise ValueError("private WNA16 dispatch requires Triton WNA16")
+            routed_experts.set_phase4_residency(
+                Phase4GpuResidencyAdapter(
+                    enabled=True,
+                    model_family="Qwen3-30B-A3B",
+                    quantization="WNA16",
+                    backend_supports_dynamic_map=True,
+                    private_dispatch_enabled=True,
+                    private_dispatch_layer_id=layer_id,
+                )
+            )
+            bind_private_wna16_generation_view_provider(
+                layer_id=layer_id, routed_experts=routed_experts
+            )
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         assert hidden_states.dim() <= 2, (
@@ -383,6 +444,7 @@ class Qwen3MoeDecoderLayer(nn.Module):
         ):
             self.mlp = Qwen3MoeSparseMoeBlock(
                 vllm_config=vllm_config,
+                layer_id=layer_idx,
                 prefix=f"{prefix}.mlp",
                 is_fused_checkpoint_transposed=is_fused_checkpoint_transposed,
             )
@@ -452,6 +514,9 @@ class Qwen3MoeModel(nn.Module, EagleModelMixin):
         parallel_config = vllm_config.parallel_config
         eplb_config = parallel_config.eplb_config
         self.num_redundant_experts = eplb_config.num_redundant_experts
+        private_layer = _validate_private_wna16_selection(
+            vllm_config, config, decoder_layer_type
+        )
 
         self.vocab_size = config.vocab_size
         self.config = config
@@ -467,6 +532,10 @@ class Qwen3MoeModel(nn.Module, EagleModelMixin):
             lambda prefix: decoder_layer_type(vllm_config=vllm_config, prefix=prefix),
             prefix=f"{prefix}.layers",
         )
+        if private_layer is not None and not (
+            self.start_layer <= private_layer < self.end_layer
+        ):
+            raise ValueError("private WNA16 dispatch layer is not local to this rank")
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.make_empty_intermediate_tensors = make_empty_intermediate_tensors_factory(
             ["hidden_states", "residual"], config.hidden_size
