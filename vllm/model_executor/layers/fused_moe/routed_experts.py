@@ -16,6 +16,9 @@ from vllm.model_executor.layers.fused_moe.config import (
 from vllm.model_executor.layers.fused_moe.expert_map_manager import (
     ExpertMapManager,
 )
+from vllm.model_executor.layers.fused_moe.expert_residency import (
+    Phase4GpuResidencyAdapter,
+)
 from vllm.model_executor.layers.fused_moe.fused_moe_method_base import (
     FusedMoEMethodBase,
 )
@@ -82,6 +85,8 @@ class RoutedExperts(PluggableLayer):
         apply_router_weight_on_input: bool = False,
     ):
         super().__init__()
+        # Opt-in only; the ordinary modular path remains unchanged.
+        self._phase4_residency: Phase4GpuResidencyAdapter | None = None
         self.layer_name = layer_name
         self.moe_config = moe_config
         self.quant_config = quant_config
@@ -291,6 +296,12 @@ class RoutedExperts(PluggableLayer):
 
         # Update local attributes from ExpertMapManager
         self.update_expert_map_info()
+
+    def set_phase4_residency(
+        self, adapter: Phase4GpuResidencyAdapter | None
+    ) -> None:
+        """Install the bounded fail-closed adapter without changing the manager."""
+        self._phase4_residency = adapter
 
     def _map_global_expert_id_to_local_expert_id(self, expert_id: int) -> int:
         """Map global expert ID to local expert ID."""
@@ -1248,7 +1259,10 @@ class RoutedExperts(PluggableLayer):
         """
         assert not self.quant_method.is_monolithic
 
-        # Modular kernels use pre-computed routing
+        # Modular kernels use pre-computed routing. The unimplemented Phase 4
+        # seam rejects before apply and never rewrites canonical router output.
+        if self._phase4_residency is not None:
+            self._phase4_residency.validate_request(topk_ids, topk_weights)
         return self.quant_method.apply(
             layer=self,
             x=x,

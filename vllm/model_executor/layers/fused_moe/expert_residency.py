@@ -15,7 +15,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import Enum, auto
-from typing import Callable
+from typing import Callable, Mapping
+
+import torch
 
 
 @dataclass(frozen=True, slots=True)
@@ -480,3 +482,180 @@ class ExpertResidencyTable:
                 assert entry.pins == 0
             else:
                 assert False, f"unexpected quiescent slot state: {entry.state}"
+
+
+class Phase4FailureCategory(Enum):
+    """Categories reserved by the fail-closed residency protocol."""
+
+    CAPACITY = "capacity"
+    TRANSFER = "transfer"
+    VALIDATION = "validation"
+    TIMEOUT = "timeout"
+    STALE_LEASE = "stale lease"
+    UNSUPPORTED_DYNAMIC_MAP = "unsupported dynamic map"
+
+
+class Phase4UnsupportedError(RuntimeError):
+    """Raised when the bounded GPU residency seam cannot be used safely."""
+
+    def __init__(self, category: Phase4FailureCategory, diagnostic: str) -> None:
+        self.category = category
+        self.diagnostic = diagnostic
+        super().__init__(f"Phase 4 {category.value}: {diagnostic}")
+
+
+@dataclass(frozen=True, slots=True)
+class Phase4Capability:
+    """Explicit result of checking the narrow Phase-4 support matrix."""
+
+    supported: bool
+    category: Phase4FailureCategory
+    reason: str
+
+
+@dataclass(frozen=True, slots=True)
+class PostConversionExpertBundle:
+    """Complete post-conversion expert data suitable for a transfer reference.
+
+    ``tensors`` contains the three named WNA16 projections consumed by the
+    quantized apply path. This type deliberately has no checkpoint or
+    tensor-slice loading API.
+    """
+
+    schema_version: int
+    tensors: Mapping[str, torch.Tensor]
+    metadata: Mapping[str, object]
+
+
+class TorchCpuTransferReference:
+    """CPU-only transfer oracle for complete post-conversion bundles."""
+
+    REQUIRED_TENSORS = frozenset({"gate_proj", "up_proj", "down_proj"})
+    REQUIRED_METADATA = frozenset({"weight_shapes", "quantization"})
+    ALLOWED_METADATA = REQUIRED_METADATA
+
+    @classmethod
+    def transfer(
+        cls, bundle: PostConversionExpertBundle
+    ) -> PostConversionExpertBundle:
+        """Clone a validated complete bundle onto CPU, or reject it."""
+        if not isinstance(bundle, PostConversionExpertBundle):
+            raise ValueError("expected a post-conversion expert bundle")
+        if bundle.schema_version != 1:
+            raise ValueError("unsupported post-conversion bundle schema")
+        if not isinstance(bundle.tensors, Mapping):
+            raise ValueError("bundle tensors must be a named tensor mapping")
+        if not isinstance(bundle.metadata, Mapping):
+            raise ValueError("bundle metadata must be a mapping")
+        tensor_names = frozenset(bundle.tensors)
+        if tensor_names != cls.REQUIRED_TENSORS:
+            raise ValueError("bundle must contain exactly all WNA16 tensors")
+        if any(not isinstance(t, torch.Tensor) for t in bundle.tensors.values()):
+            raise ValueError("bundle tensor values must be tensors")
+        if any(t.device.type != "cpu" for t in bundle.tensors.values()):
+            raise ValueError("CPU transfer oracle accepts CPU tensors only")
+        if any(not t.is_contiguous() for t in bundle.tensors.values()):
+            raise ValueError("bundle tensors must be contiguous")
+        if frozenset(bundle.metadata) != cls.ALLOWED_METADATA:
+            raise ValueError("bundle metadata is incomplete")
+        shapes = bundle.metadata["weight_shapes"]
+        if not isinstance(shapes, Mapping) or frozenset(shapes) != tensor_names:
+            raise ValueError("bundle weight shapes do not match tensor identities")
+        if any(
+            not isinstance(shapes[name], (tuple, list, torch.Size))
+            or any(not isinstance(dim, int) or dim < 0 for dim in shapes[name])
+            for name in tensor_names
+        ):
+            raise ValueError("bundle weight shapes are invalid")
+        if bundle.metadata["quantization"] != "WNA16":
+            raise ValueError("bundle quantization must be WNA16")
+        if any(
+            tuple(t.shape) != tuple(shapes[name])
+            for name, t in bundle.tensors.items()
+        ):
+            raise ValueError("bundle weight shapes are inconsistent")
+        copied = {name: t.detach().clone() for name, t in bundle.tensors.items()}
+        return PostConversionExpertBundle(
+            schema_version=bundle.schema_version,
+            tensors=copied,
+            metadata=dict(bundle.metadata),
+        )
+
+
+class Phase4GpuResidencyAdapter:
+    """Default-off, fail-closed adapter for the unproven GPU backend seam.
+
+    The adapter intentionally does not copy tensors or mutate routing. Until a
+    backend demonstrates per-call dynamic map support, ``validate_request``
+    rejects every enabled request with an actionable diagnostic.
+    """
+
+    def __init__(
+        self,
+        *,
+        enabled: bool = False,
+        model_family: str = "",
+        quantization: str = "",
+        execution_mode: str = "eager",
+        modular: bool = True,
+        backend_supports_dynamic_map: bool = False,
+    ) -> None:
+        self.enabled = enabled
+        self.model_family = model_family
+        self.quantization = quantization
+        self.execution_mode = execution_mode
+        self.modular = modular
+        self.backend_supports_dynamic_map = backend_supports_dynamic_map
+        self.unsupported_requests = 0
+
+    def capability(self) -> Phase4Capability:
+        if not self.enabled:
+            return Phase4Capability(
+                False,
+                Phase4FailureCategory.UNSUPPORTED_DYNAMIC_MAP,
+                "disabled by default",
+            )
+        if self.model_family != "Qwen3-30B-A3B":
+            return Phase4Capability(
+                False,
+                Phase4FailureCategory.VALIDATION,
+                "only Qwen3-30B-A3B is supported",
+            )
+        if self.quantization not in ("AWQ", "WNA16"):
+            return Phase4Capability(
+                False,
+                Phase4FailureCategory.VALIDATION,
+                "only AWQ/WNA16 is supported",
+            )
+        if self.execution_mode != "eager":
+            return Phase4Capability(
+                False,
+                Phase4FailureCategory.VALIDATION,
+                "only eager execution is supported",
+            )
+        if not self.modular:
+            return Phase4Capability(
+                False,
+                Phase4FailureCategory.VALIDATION,
+                "only modular execution is supported",
+            )
+        if not self.backend_supports_dynamic_map:
+            return Phase4Capability(
+                False,
+                Phase4FailureCategory.UNSUPPORTED_DYNAMIC_MAP,
+                "backend lacks per-call dynamic map support",
+            )
+        return Phase4Capability(
+            False,
+            Phase4FailureCategory.UNSUPPORTED_DYNAMIC_MAP,
+            "GPU transfer controller is not implemented",
+        )
+
+    def validate_request(
+        self, topk_ids: torch.Tensor, topk_weights: torch.Tensor
+    ) -> None:
+        """Reject before apply; canonical router outputs are never rewritten."""
+        del topk_ids, topk_weights
+        self.unsupported_requests += 1
+        capability = self.capability()
+        raise Phase4UnsupportedError(capability.category, capability.reason)
