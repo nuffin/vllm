@@ -16,6 +16,7 @@ from __future__ import annotations
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from enum import Enum, auto
+from typing import ClassVar
 
 import torch
 
@@ -659,3 +660,363 @@ class Phase4GpuResidencyAdapter:
         self.unsupported_requests += 1
         capability = self.capability()
         raise Phase4UnsupportedError(capability.category, capability.reason)
+
+    def validate_generation_view(
+        self,
+        view: WNA16GenerationView,
+        *,
+        layer_id: int | None = None,
+    ) -> None:
+        """Validate a complete private-slot view without dispatching CUDA."""
+        validate_wna16_generation_view(view, layer_id=layer_id)
+        if not self.enabled:
+            self.unsupported_requests += 1
+            raise Phase4UnsupportedError(
+                Phase4FailureCategory.UNSUPPORTED_DYNAMIC_MAP,
+                "private WNA16 ABI is disabled by default",
+            )
+        capability = self.capability()
+        if not capability.supported:
+            self.unsupported_requests += 1
+            raise Phase4UnsupportedError(capability.category, capability.reason)
+
+
+def _snapshot_tensor(tensor: torch.Tensor) -> torch.Tensor:
+    if tensor.is_contiguous():
+        return tensor.detach().clone()
+    snapshot = torch.empty_strided(
+        tensor.shape,
+        tensor.stride(),
+        dtype=tensor.dtype,
+        device=tensor.device,
+    )
+    return snapshot.copy_(tensor.detach())
+
+
+@dataclass(frozen=True, slots=True)
+class WNA16ExpertBundle:
+    """Versioned, post-conversion WNA16 tensors for one private slot set.
+
+    This is an additive controller/operator ABI.  It is deliberately separate
+    from ``PostConversionExpertBundle``: callers must provide the tensors in
+    the layout consumed by the selected operator, never checkpoint tensors.
+    """
+
+    schema_version: int
+    backend: str
+    layer_id: int
+    global_num_experts: int
+    slot_count: int
+    generation: int
+    quant_type: str
+    num_bits: int
+    symmetric: bool
+    group_size: int
+    act_order: bool
+    w13: torch.Tensor
+    w2: torch.Tensor
+    w13_scale: torch.Tensor
+    w2_scale: torch.Tensor
+    w13_zero: torch.Tensor | None = None
+    w2_zero: torch.Tensor | None = None
+
+    _TENSOR_FIELDS: ClassVar[frozenset[str]] = frozenset(
+        {"w13", "w2", "w13_scale", "w2_scale", "w13_zero", "w2_zero"}
+    )
+
+    def __getattribute__(self, name: str) -> object:
+        value = object.__getattribute__(self, name)
+        if (
+            name in WNA16ExpertBundle._TENSOR_FIELDS
+            and isinstance(value, torch.Tensor)
+        ):
+            return _snapshot_tensor(value)
+        return value
+
+    def __post_init__(self) -> None:
+        for name in (
+            "w13",
+            "w2",
+            "w13_scale",
+            "w2_scale",
+            "w13_zero",
+            "w2_zero",
+        ):
+            tensor = getattr(self, name)
+            if isinstance(tensor, torch.Tensor):
+                object.__setattr__(self, name, _snapshot_tensor(tensor))
+
+
+@dataclass(frozen=True, slots=True)
+class WNA16GenerationView:
+    """Immutable request view joining a complete bundle and private map."""
+
+    bundle: WNA16ExpertBundle
+    slot_map: torch.Tensor
+    map_generation: int
+    use_lease: "WNA16UseLease"
+
+    def __getattribute__(self, name: str) -> object:
+        value = object.__getattribute__(self, name)
+        if name == "slot_map" and isinstance(value, torch.Tensor):
+            return _snapshot_tensor(value)
+        return value
+
+    def __post_init__(self) -> None:
+        if isinstance(self.slot_map, torch.Tensor):
+            object.__setattr__(
+                self, "slot_map", _snapshot_tensor(self.slot_map)
+            )
+
+
+@dataclass(frozen=True, slots=True)
+class WNA16UseLease:
+    """Opaque association authorizing one WNA16 generation view."""
+
+    layer_id: int
+    generation: int
+    bundle: WNA16ExpertBundle
+    token: int
+
+
+def validate_wna16_generation_view(
+    view: WNA16GenerationView,
+    *,
+    layer_id: int | None = None,
+) -> None:
+    """Validate the ABI before an operator is allowed to dispatch."""
+    if not isinstance(view, WNA16GenerationView):
+        raise Phase4UnsupportedError(
+            Phase4FailureCategory.VALIDATION,
+            "WNA16 private execution requires a generation view",
+        )
+    bundle = view.bundle
+    if not isinstance(bundle, WNA16ExpertBundle):
+        raise Phase4UnsupportedError(
+            Phase4FailureCategory.VALIDATION,
+            "generation view bundle has an invalid type",
+        )
+    int_fields = (
+        ("schema_version", bundle.schema_version),
+        ("layer_id", bundle.layer_id),
+        ("global_num_experts", bundle.global_num_experts),
+        ("slot_count", bundle.slot_count),
+        ("generation", bundle.generation),
+        ("num_bits", bundle.num_bits),
+        ("group_size", bundle.group_size),
+        ("map_generation", view.map_generation),
+    )
+    if any(type(value) is not int or value < 0 for _, value in int_fields):
+        raise Phase4UnsupportedError(
+            Phase4FailureCategory.VALIDATION,
+            "WNA16 scalar metadata must be non-negative integers",
+        )
+    if type(bundle.symmetric) is not bool or type(bundle.act_order) is not bool:
+        raise Phase4UnsupportedError(
+            Phase4FailureCategory.VALIDATION,
+            "WNA16 boolean metadata has an invalid type",
+        )
+    if type(bundle.backend) is not str or bundle.backend != "triton":
+        raise Phase4UnsupportedError(
+            Phase4FailureCategory.VALIDATION,
+            "unsupported WNA16 backend/layout",
+        )
+    if bundle.schema_version != 1:
+        raise Phase4UnsupportedError(
+            Phase4FailureCategory.VALIDATION,
+            "bundle schema/backend mismatch",
+        )
+    if type(bundle.quant_type) is not str or bundle.quant_type not in (
+        "W4A16",
+        "W8A16",
+    ):
+        raise Phase4UnsupportedError(
+            Phase4FailureCategory.VALIDATION,
+            "unsupported WNA16 quant_type",
+        )
+    if bundle.num_bits != int(bundle.quant_type[1]):
+        raise Phase4UnsupportedError(
+            Phase4FailureCategory.VALIDATION,
+            "quant_type and num_bits do not match",
+        )
+    if layer_id is not None and bundle.layer_id != layer_id:
+        raise Phase4UnsupportedError(
+            Phase4FailureCategory.VALIDATION,
+            "bundle layer mismatch",
+        )
+    if (
+        bundle.layer_id < 0
+        or bundle.global_num_experts <= 0
+        or bundle.slot_count <= 0
+        or bundle.slot_count > bundle.global_num_experts
+    ):
+        raise Phase4UnsupportedError(
+            Phase4FailureCategory.VALIDATION,
+            "bundle expert and slot counts must be positive",
+        )
+    if bundle.group_size <= 0:
+        raise Phase4UnsupportedError(
+            Phase4FailureCategory.VALIDATION,
+            "invalid WNA16 quantization metadata",
+        )
+    weights = (bundle.w13, bundle.w2)
+    scales = (bundle.w13_scale, bundle.w2_scale)
+    tensors = weights + scales
+    # Triton consumes N-first uint8 tensors: [S, N_out, K / 2] for
+    # W4A16 and [S, N_out, K] for W8A16. Scales are [S, N_out, K / 32].
+    packing_factor = 2 if bundle.num_bits == 4 else 1
+    if any(not isinstance(tensor, torch.Tensor) for tensor in tensors):
+        raise Phase4UnsupportedError(
+            Phase4FailureCategory.VALIDATION,
+            "incomplete post-conversion Triton bundle",
+        )
+    if any(not tensor.is_contiguous() for tensor in tensors):
+        raise Phase4UnsupportedError(
+            Phase4FailureCategory.VALIDATION,
+            "bundle tensors must be contiguous post-conversion tensors",
+        )
+    if any(tensor.device != bundle.w13.device for tensor in tensors):
+        raise Phase4UnsupportedError(
+            Phase4FailureCategory.VALIDATION,
+            "bundle tensors must share a device",
+        )
+    if any(tensor.dtype != torch.uint8 for tensor in weights):
+        raise Phase4UnsupportedError(
+            Phase4FailureCategory.VALIDATION,
+            "packed WNA16 weights must be uint8",
+        )
+    if any(tensor.dtype != torch.float32 for tensor in scales):
+        raise Phase4UnsupportedError(
+            Phase4FailureCategory.VALIDATION,
+            "WNA16 scales must be float32",
+        )
+    if any(tensor.ndim != 3 or tensor.shape[0] != bundle.slot_count
+           for tensor in tensors):
+        raise Phase4UnsupportedError(
+            Phase4FailureCategory.VALIDATION,
+            "WNA16 tensors must have rank 3 and leading slot_count",
+        )
+    if bundle.group_size != 32:
+        raise Phase4UnsupportedError(
+            Phase4FailureCategory.VALIDATION,
+            "WNA16 ABI requires group_size 32",
+        )
+    w13_rows, w13_packed_cols = weights[0].shape[1:]
+    w2_rows, w2_packed_cols = weights[1].shape[1:]
+    if min(w13_rows, w13_packed_cols, w2_rows, w2_packed_cols) <= 0:
+        raise Phase4UnsupportedError(
+            Phase4FailureCategory.VALIDATION,
+            "packed WNA16 dimensions must be positive",
+        )
+    if w13_rows != 2 * w2_rows:
+        raise Phase4UnsupportedError(
+            Phase4FailureCategory.VALIDATION,
+            "w13 rows must be twice the w2 rows",
+        )
+    w13_input = w13_packed_cols * packing_factor
+    w2_input = w2_packed_cols * packing_factor
+    if w13_input % bundle.group_size or w2_input % bundle.group_size:
+        raise Phase4UnsupportedError(
+            Phase4FailureCategory.VALIDATION,
+            "packed input dimensions must contain complete quantization groups",
+        )
+    if w13_input != w2_rows or w2_input != w13_rows // 2:
+        raise Phase4UnsupportedError(
+            Phase4FailureCategory.VALIDATION,
+            "w13 and w2 packed dimensions are incompatible",
+        )
+    expected_scale_shapes = (
+        (bundle.slot_count, w13_rows, w13_input // bundle.group_size),
+        (bundle.slot_count, w2_rows, w2_input // bundle.group_size),
+    )
+    if tuple(scales[0].shape) != expected_scale_shapes[0] or tuple(
+        scales[1].shape
+    ) != expected_scale_shapes[1]:
+        raise Phase4UnsupportedError(
+            Phase4FailureCategory.VALIDATION,
+            "WNA16 scale shapes do not match packed weight dimensions",
+        )
+    zero_tensors = (bundle.w13_zero, bundle.w2_zero)
+    if any(
+        zero is not None
+        and (
+            not isinstance(zero, torch.Tensor)
+            or not zero.is_contiguous()
+            or zero.device != bundle.w13.device
+            or zero.dtype != torch.uint8
+        )
+        for zero in zero_tensors
+    ):
+        raise Phase4UnsupportedError(
+            Phase4FailureCategory.VALIDATION,
+            "zero-point tensors must be contiguous uint8 tensors on "
+            "the bundle device",
+        )
+    if (
+        bundle.symmetric
+        and (bundle.w13_zero is not None or bundle.w2_zero is not None)
+    ) or (
+        not bundle.symmetric
+        and (bundle.w13_zero is None or bundle.w2_zero is None)
+    ):
+        raise Phase4UnsupportedError(
+            Phase4FailureCategory.VALIDATION,
+            "incomplete symmetric/asymmetric zero-point state",
+        )
+    if not bundle.symmetric:
+        expected_zero_shapes = (
+            (bundle.slot_count, w13_rows // 2, w13_input // bundle.group_size)
+            if bundle.num_bits == 4
+            else (bundle.slot_count, w13_rows, w13_input // bundle.group_size),
+            (bundle.slot_count, w2_rows // 2, w2_input // bundle.group_size)
+            if bundle.num_bits == 4
+            else (bundle.slot_count, w2_rows, w2_input // bundle.group_size),
+        )
+        if tuple(bundle.w13_zero.shape) != expected_zero_shapes[0] or tuple(
+            bundle.w2_zero.shape
+        ) != expected_zero_shapes[1]:
+            raise Phase4UnsupportedError(
+                Phase4FailureCategory.VALIDATION,
+                "zero-point tensor shapes do not match Triton layout",
+            )
+    slot_map = view.slot_map
+    if (
+        not isinstance(slot_map, torch.Tensor)
+        or slot_map.ndim != 1
+        or slot_map.numel() != bundle.global_num_experts
+        or slot_map.dtype != torch.int32
+        or not slot_map.is_contiguous()
+    ):
+        raise Phase4UnsupportedError(
+            Phase4FailureCategory.VALIDATION,
+            "slot_map must be contiguous int32 [global_num_experts]",
+        )
+    if slot_map.device != bundle.w13.device:
+        raise Phase4UnsupportedError(
+            Phase4FailureCategory.VALIDATION,
+            "slot_map.device must match bundle tensor device",
+        )
+    values = slot_map.detach().cpu().tolist()
+    resident = [value for value in values if value != -1]
+    if (
+        any(value < -1 or value >= bundle.slot_count for value in resident)
+        or len(resident) != len(set(resident))
+    ):
+        raise Phase4UnsupportedError(
+            Phase4FailureCategory.VALIDATION,
+            "slot_map entries must be -1 or unique in-range slots",
+        )
+    lease = view.use_lease
+    if (
+        not isinstance(lease, WNA16UseLease)
+        or type(lease.token) is not int
+        or lease.token < 0
+        or lease.layer_id != bundle.layer_id
+        or lease.generation != bundle.generation
+        or lease.bundle is not bundle
+        or view.map_generation != bundle.generation
+    ):
+        raise Phase4UnsupportedError(
+            Phase4FailureCategory.STALE_LEASE,
+            "generation or map_generation is stale",
+        )

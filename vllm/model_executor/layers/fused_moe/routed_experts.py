@@ -20,6 +20,7 @@ from vllm.model_executor.layers.fused_moe.expert_residency import (
     Phase4FailureCategory,
     Phase4GpuResidencyAdapter,
     Phase4UnsupportedError,
+    WNA16GenerationView,
 )
 from vllm.model_executor.layers.fused_moe.fused_moe_method_base import (
     FusedMoEMethodBase,
@@ -1240,6 +1241,7 @@ class RoutedExperts(PluggableLayer):
         shared_experts: "SharedExperts | None" = None,
         shared_experts_input: torch.Tensor | None = None,
         transient_expert_map: torch.Tensor | None = None,
+        generation_view: WNA16GenerationView | None = None,
     ) -> torch.Tensor:
         """
         Execute routed experts using the quantization method's apply function.
@@ -1256,11 +1258,30 @@ class RoutedExperts(PluggableLayer):
             shared_experts_input: Input for shared experts (if any)
             transient_expert_map: Request-local residency slot map. It is
                 rejected unless a capable residency adapter is installed.
+            generation_view: Complete, immutable WNA16 private-slot ABI view.
+                It is validated before dispatch and remains default-off.
 
         Returns:
             Output tensor from routed experts.
         """
         assert not self.quant_method.is_monolithic
+
+        if generation_view is not None:
+            if transient_expert_map is not None:
+                raise Phase4UnsupportedError(
+                    Phase4FailureCategory.VALIDATION,
+                    "generation_view and transient_expert_map are mutually exclusive",
+                )
+            if self._phase4_residency is None:
+                raise Phase4UnsupportedError(
+                    Phase4FailureCategory.UNSUPPORTED_DYNAMIC_MAP,
+                    "generation_view requires a residency adapter",
+                )
+            self._phase4_residency.validate_generation_view(generation_view)
+            raise Phase4UnsupportedError(
+                Phase4FailureCategory.UNSUPPORTED_DYNAMIC_MAP,
+                "private WNA16 operator dispatch is not implemented for this method",
+            )
 
         # Modular kernels use pre-computed routing. The unimplemented Phase 4
         # seam rejects before apply and never rewrites canonical router output.

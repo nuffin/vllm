@@ -7,6 +7,7 @@ from dataclasses import astuple, replace
 from random import Random
 
 import pytest
+import torch
 
 from vllm.model_executor.layers.fused_moe.expert_residency import (
     ExpertBundle,
@@ -14,13 +15,208 @@ from vllm.model_executor.layers.fused_moe.expert_residency import (
     ExpertResidencyTable,
     EventKind,
     LoadStatus,
+    Phase4FailureCategory,
+    Phase4GpuResidencyAdapter,
+    Phase4UnsupportedError,
     ResidencyAccounting,
     SlotState,
+    WNA16ExpertBundle,
+    WNA16GenerationView,
+    WNA16UseLease,
+    validate_wna16_generation_view,
 )
 
 
 def bundle(generation: int, payload: object | None = None) -> ExpertBundle:
     return ExpertBundle(generation=generation, payload=payload)
+
+
+def private_view(slot_map: torch.Tensor | None = None) -> WNA16GenerationView:
+    w13 = torch.zeros((2, 64, 16), dtype=torch.uint8)
+    w2 = torch.zeros((2, 32, 16), dtype=torch.uint8)
+    w13_scale = torch.ones((2, 64, 1), dtype=torch.float32)
+    w2_scale = torch.ones((2, 32, 1), dtype=torch.float32)
+    bundle = WNA16ExpertBundle(
+        schema_version=1,
+        backend="triton",
+        layer_id=3,
+        global_num_experts=4,
+        slot_count=2,
+        generation=9,
+        quant_type="W4A16",
+        num_bits=4,
+        symmetric=True,
+        group_size=32,
+        act_order=False,
+        w13=w13,
+        w2=w2,
+        w13_scale=w13_scale,
+        w2_scale=w2_scale,
+    )
+    if slot_map is None:
+        slot_map = torch.tensor([0, -1, 1, -1], dtype=torch.int32)
+    lease = WNA16UseLease(layer_id=3, generation=9, bundle=bundle, token=1)
+    return WNA16GenerationView(bundle, slot_map, 9, lease)
+
+
+def test_wna16_private_view_validates_complete_bundle_and_map():
+    validate_wna16_generation_view(private_view())
+
+
+def test_wna16_private_view_accepts_actual_triton_n_first_layout():
+    view = private_view()
+    assert view.bundle.w13.dtype is torch.uint8
+    validate_wna16_generation_view(view)
+
+
+def test_wna16_private_view_rejects_backend_layout_mismatch():
+    view = private_view()
+    bundle = replace(view.bundle, backend="humming")
+    with pytest.raises(Phase4UnsupportedError, match="backend"):
+        validate_wna16_generation_view(replace(view, bundle=bundle))
+
+
+def test_wna16_private_view_rejects_slot_map_on_different_device():
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is unavailable")
+    view = private_view(torch.tensor([0, -1, 1, -1], device="cuda", dtype=torch.int32))
+    with pytest.raises(Phase4UnsupportedError, match="slot_map.*device"):
+        validate_wna16_generation_view(view)
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    (
+        (
+            "w13",
+            torch.zeros((2, 64, 16), dtype=torch.float16),
+            "weights must be uint8",
+        ),
+        (
+            "w13",
+            torch.zeros((2, 64, 1), dtype=torch.uint8),
+            "complete quantization groups",
+        ),
+        ("w13", torch.zeros((2, 64), dtype=torch.uint8), "rank 3"),
+        ("w13_scale", torch.ones((2, 64, 2)), "scale shapes"),
+        ("w2", torch.zeros((2, 16, 16), dtype=torch.uint8), "twice the w2 rows"),
+    ),
+)
+def test_wna16_private_view_rejects_malformed_tensor_schema(
+    field: str, value: torch.Tensor, message: str
+):
+    view = private_view()
+    bundle = replace(view.bundle, **{field: value})
+    view = replace(
+        view,
+        bundle=bundle,
+        use_lease=WNA16UseLease(3, 9, bundle, 1),
+    )
+
+    with pytest.raises(Phase4UnsupportedError, match=message) as error:
+        validate_wna16_generation_view(view)
+    assert error.value.category is Phase4FailureCategory.VALIDATION
+
+
+def test_wna16_private_view_rejects_duplicate_slot_before_dispatch():
+    view = private_view(torch.tensor([0, 0, 1, -1], dtype=torch.int32))
+    with pytest.raises(Phase4UnsupportedError, match="unique") as error:
+        validate_wna16_generation_view(view)
+    assert error.value.category is Phase4FailureCategory.VALIDATION
+
+
+def test_wna16_private_view_is_default_off_even_when_structurally_valid():
+    adapter = Phase4GpuResidencyAdapter()
+    with pytest.raises(Phase4UnsupportedError, match="disabled by default") as error:
+        adapter.validate_generation_view(private_view())
+    assert error.value.category is Phase4FailureCategory.UNSUPPORTED_DYNAMIC_MAP
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    (("quant_type", "invalid"), ("num_bits", 16), ("group_size", 0)),
+)
+def test_wna16_private_view_rejects_invalid_quantization_metadata(field, value):
+    view = private_view()
+    bundle = replace(view.bundle, **{field: value})
+    view = replace(view, bundle=bundle)
+    with pytest.raises(Phase4UnsupportedError) as error:
+        validate_wna16_generation_view(view)
+    assert error.value.category is Phase4FailureCategory.VALIDATION
+
+
+def test_wna16_private_view_rejects_malformed_nested_bundle():
+    view = replace(private_view(), bundle=object())
+    with pytest.raises(Phase4UnsupportedError) as error:
+        validate_wna16_generation_view(view)
+    assert error.value.category is Phase4FailureCategory.VALIDATION
+
+
+def test_wna16_private_view_snapshots_input_tensors():
+    view = private_view()
+    source = torch.zeros((2, 64, 16), dtype=torch.uint8)
+    bundle = replace(view.bundle, w13=source)
+    source.fill_(7)
+    view.bundle.w13.fill_(7)
+    view.slot_map.fill_(1)
+    view = replace(
+        view,
+        bundle=bundle,
+        use_lease=WNA16UseLease(3, 9, bundle, 1),
+    )
+    validate_wna16_generation_view(view)
+    assert torch.count_nonzero(view.bundle.w13) == 0
+
+
+def test_wna16_private_view_rejects_stale_or_unassociated_lease():
+    view = private_view()
+    stale = WNA16UseLease(3, 8, view.bundle, 1)
+    with pytest.raises(Phase4UnsupportedError) as error:
+        validate_wna16_generation_view(replace(view, use_lease=stale))
+    assert error.value.category is Phase4FailureCategory.STALE_LEASE
+    foreign = private_view().bundle
+    unrelated = WNA16UseLease(3, 9, foreign, 1)
+    with pytest.raises(Phase4UnsupportedError) as error:
+        validate_wna16_generation_view(replace(view, use_lease=unrelated))
+    assert error.value.category is Phase4FailureCategory.STALE_LEASE
+
+
+def test_wna16_private_view_rejects_asymmetric_zero_point_mismatch():
+    view = private_view()
+    bundle = replace(
+        view.bundle,
+        symmetric=False,
+        w13_zero=torch.zeros((2, 31, 1), dtype=torch.uint8),
+        w2_zero=torch.zeros((2, 16, 1), dtype=torch.uint8),
+    )
+    view = replace(
+        view,
+        bundle=bundle,
+        use_lease=WNA16UseLease(3, 9, bundle, 1),
+    )
+    with pytest.raises(Phase4UnsupportedError, match="shapes"):
+        validate_wna16_generation_view(view)
+
+
+@pytest.mark.parametrize(
+    "zero",
+    (object(), torch.zeros((2, 8), dtype=torch.uint8)[:, ::2]),
+)
+def test_wna16_private_view_rejects_malformed_zero_point_tensor(zero):
+    view = private_view()
+    bundle = replace(
+        view.bundle,
+        symmetric=False,
+        w13_zero=zero,
+        w2_zero=torch.zeros((2, 16, 1), dtype=torch.uint8),
+    )
+    view = replace(
+        view,
+        bundle=bundle,
+        use_lease=WNA16UseLease(3, 9, bundle, 1),
+    )
+    with pytest.raises(Phase4UnsupportedError, match="zero-point"):
+        validate_wna16_generation_view(view)
 
 
 def test_layer_qualified_keys_are_immutable_and_reject_negative_ids():
