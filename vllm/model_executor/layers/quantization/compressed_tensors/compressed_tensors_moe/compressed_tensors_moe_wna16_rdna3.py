@@ -62,6 +62,8 @@ class CompressedTensorsWNA16RDNA3MoEMethod(CompressedTensorsWNA16MoEMethod):
     the fused HIP kernel directly.
     """
 
+    supports_transient_expert_map = True
+
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         device = layer.w13_weight_packed.device
         num_experts = layer.w13_weight_packed.shape[0]
@@ -131,7 +133,12 @@ class CompressedTensorsWNA16RDNA3MoEMethod(CompressedTensorsWNA16MoEMethod):
         topk_ids: torch.Tensor,
         shared_experts: SharedExperts | None,
         shared_experts_input: torch.Tensor | None,
+        transient_expert_map: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        if transient_expert_map is not None:
+            raise RuntimeError(
+                "WNA16 transient expert map requires a proven backend contract"
+            )
         activation = (
             layer.activation
             if isinstance(layer.activation, MoEActivation)

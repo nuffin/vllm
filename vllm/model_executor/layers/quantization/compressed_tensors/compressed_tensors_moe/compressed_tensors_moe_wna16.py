@@ -55,6 +55,10 @@ logger = init_logger(__name__)
 
 
 class CompressedTensorsWNA16MoEMethod(CompressedTensorsMoEMethod):
+    # Explicit protocol marker for RoutedExperts' transient-map gate. The
+    # apply path remains fail-closed until a backend implements the contract.
+    supports_transient_expert_map = True
+
     def __init__(
         self,
         weight_quant: QuantizationArgs,
@@ -658,9 +662,14 @@ class CompressedTensorsWNA16MoEMethod(CompressedTensorsMoEMethod):
         topk_ids: torch.Tensor,
         shared_experts: SharedExperts | None,
         shared_experts_input: torch.Tensor | None,
+        transient_expert_map: torch.Tensor | None = None,
     ) -> torch.Tensor:
         assert not self.is_monolithic
         assert self.moe_kernel is not None
+        if transient_expert_map is not None:
+            raise RuntimeError(
+                "WNA16 transient expert map requires a proven backend contract"
+            )
         return self.moe_kernel.apply(
             x,
             layer.w13_weight,

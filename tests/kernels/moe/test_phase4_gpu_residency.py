@@ -3,10 +3,17 @@
 
 from __future__ import annotations
 
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
 import torch
+from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors_moe.compressed_tensors_moe_wna16 import (
+    CompressedTensorsWNA16MoEMethod,
+)
+from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors_moe.compressed_tensors_moe_wna16_rdna3 import (
+    CompressedTensorsWNA16RDNA3MoEMethod,
+)
 
 from vllm.model_executor.layers.fused_moe.expert_residency import (
     Phase4FailureCategory,
@@ -79,11 +86,8 @@ def test_dynamic_map_claim_still_fails_closed_until_controller_exists():
         backend_supports_dynamic_map=True,
     )
 
-    assert (
-        adapter.capability().category
-        is Phase4FailureCategory.UNSUPPORTED_DYNAMIC_MAP
-    )
-    with pytest.raises(Phase4UnsupportedError, match="not implemented"):
+    assert adapter.capability().category is Phase4FailureCategory.VALIDATION
+    with pytest.raises(Phase4UnsupportedError, match="only WNA16 is supported"):
         adapter.validate_request(torch.tensor([[2, 0]]), torch.ones(1, 2))
 
 
@@ -94,8 +98,7 @@ def test_cpu_reference_transfers_complete_post_conversion_bundle():
 
     assert all(t.device.type == "cpu" for t in transferred.tensors.values())
     assert all(
-        source.tensors[name].equal(transferred.tensors[name])
-        for name in source.tensors
+        source.tensors[name].equal(transferred.tensors[name]) for name in source.tensors
     )
     assert all(
         source.tensors[name].data_ptr() != transferred.tensors[name].data_ptr()
@@ -189,3 +192,157 @@ def test_forward_modular_adapter_rejects_before_apply_without_mutation():
     assert torch.equal(weights, weights_before)
     assert layer.expert_map_manager is manager_before
     layer.quant_method.apply.assert_not_called()
+
+
+def test_forward_modular_transient_map_fails_closed_without_adapter():
+    layer = mocked_routed_experts()
+    ids = torch.tensor([[3, 1]], dtype=torch.int32)
+    weights = torch.tensor([[0.25, 0.75]])
+
+    with pytest.raises(Phase4UnsupportedError, match="WNA16 transient map contract"):
+        layer.forward_modular(
+            torch.ones(1, 2),
+            weights,
+            ids,
+            transient_expert_map=torch.tensor([-1, 0, 1, -1]),
+        )
+
+    layer.quant_method.apply.assert_not_called()
+
+
+def test_forward_modular_rejects_non_wna16_before_adapter_validation():
+    adapter = MagicMock()
+    layer = mocked_routed_experts(adapter)
+    layer.quant_method.supports_transient_expert_map = False
+    ids = torch.tensor([[3, 1]], dtype=torch.int32)
+    weights = torch.tensor([[0.25, 0.75]])
+
+    with pytest.raises(Phase4UnsupportedError, match="WNA16 transient map contract"):
+        layer.forward_modular(
+            torch.ones(1, 2),
+            weights,
+            ids,
+            transient_expert_map=torch.tensor([-1, 0, 1, -1]),
+        )
+
+    adapter.validate_request.assert_not_called()
+    layer.quant_method.apply.assert_not_called()
+
+
+def test_forward_modular_passes_transient_map_only_after_adapter_validation():
+    adapter = MagicMock()
+    layer = mocked_routed_experts(adapter)
+    layer.quant_method.supports_transient_expert_map = True
+    ids = torch.tensor([[3, 1]], dtype=torch.int32)
+    weights = torch.tensor([[0.25, 0.75]])
+    transient_map = torch.tensor([-1, 0, 1, -1])
+
+    layer.forward_modular(
+        torch.ones(1, 2),
+        weights,
+        ids,
+        transient_expert_map=transient_map,
+    )
+
+    adapter.validate_request.assert_called_once_with(ids, weights, transient_map)
+    assert (
+        layer.quant_method.apply.call_args.kwargs["transient_expert_map"]
+        is transient_map
+    )
+
+
+def test_wna16_marker_allows_gate_then_apply_remains_fail_closed():
+    class MarkedWNA16Method:
+        is_monolithic = False
+        supports_transient_expert_map = True
+
+        def apply(self, **kwargs):
+            assert kwargs["transient_expert_map"] is transient_map
+            raise RuntimeError(
+                "WNA16 transient expert map requires a proven backend contract"
+            )
+
+    adapter = MagicMock()
+    layer = mocked_routed_experts(adapter)
+    layer.quant_method = MarkedWNA16Method()
+    ids = torch.tensor([[3, 1]], dtype=torch.int32)
+    weights = torch.tensor([[0.25, 0.75]])
+    transient_map = torch.tensor([-1, 0, 1, -1])
+
+    with pytest.raises(RuntimeError, match="proven backend contract"):
+        layer.forward_modular(
+            torch.ones(1, 2),
+            weights,
+            ids,
+            transient_expert_map=transient_map,
+        )
+
+    adapter.validate_request.assert_called_once_with(ids, weights, transient_map)
+
+
+def test_wna16_methods_advertise_transient_map_contract():
+    assert CompressedTensorsWNA16MoEMethod.supports_transient_expert_map is True
+    assert CompressedTensorsWNA16RDNA3MoEMethod.supports_transient_expert_map is True
+
+
+def test_wna16_apply_rejects_transient_map_before_kernel_dispatch():
+    method = SimpleNamespace(is_monolithic=False, moe_kernel=MagicMock())
+    transient_map = torch.tensor([-1, 0, 1, -1])
+
+    with pytest.raises(RuntimeError, match="proven backend contract"):
+        CompressedTensorsWNA16MoEMethod.apply(
+            method,
+            layer=MagicMock(),
+            x=torch.ones(1, 2),
+            topk_weights=torch.ones(1, 2),
+            topk_ids=torch.tensor([[0, 1]], dtype=torch.int32),
+            shared_experts=None,
+            shared_experts_input=None,
+            transient_expert_map=transient_map,
+        )
+
+    method.moe_kernel.apply.assert_not_called()
+
+
+def test_rdna3_apply_rejects_transient_map_before_kernel_dispatch():
+    method = object.__new__(CompressedTensorsWNA16RDNA3MoEMethod)
+    transient_map = torch.tensor([-1, 0, 1, -1])
+
+    with pytest.raises(RuntimeError, match="proven backend contract"):
+        method.apply(
+            layer=MagicMock(),
+            x=torch.ones(1, 2),
+            topk_weights=torch.ones(1, 2),
+            topk_ids=torch.tensor([[0, 1]], dtype=torch.int32),
+            shared_experts=None,
+            shared_experts_input=None,
+            transient_expert_map=transient_map,
+        )
+
+
+def test_forward_modular_rejects_transient_map_for_non_wna16_method():
+    class UnsupportedQuantMethod:
+        is_monolithic = False
+
+        def apply(self, **kwargs):
+            raise AssertionError("unsupported quantization method was dispatched")
+
+    layer = mocked_routed_experts()
+    layer.quant_method = UnsupportedQuantMethod()
+    ids = torch.tensor([[3, 1]], dtype=torch.int32)
+    weights = torch.tensor([[0.25, 0.75]])
+    ids_before, weights_before = ids.clone(), weights.clone()
+    manager_before = layer.expert_map_manager
+
+    with pytest.raises(Phase4UnsupportedError) as error:
+        layer.forward_modular(
+            torch.ones(1, 2),
+            weights,
+            ids,
+            transient_expert_map=torch.tensor([-1, 0, 1, -1]),
+        )
+
+    assert error.value.category is Phase4FailureCategory.UNSUPPORTED_DYNAMIC_MAP
+    assert torch.equal(ids, ids_before)
+    assert torch.equal(weights, weights_before)
+    assert layer.expert_map_manager is manager_before

@@ -17,7 +17,9 @@ from vllm.model_executor.layers.fused_moe.expert_map_manager import (
     ExpertMapManager,
 )
 from vllm.model_executor.layers.fused_moe.expert_residency import (
+    Phase4FailureCategory,
     Phase4GpuResidencyAdapter,
+    Phase4UnsupportedError,
 )
 from vllm.model_executor.layers.fused_moe.fused_moe_method_base import (
     FusedMoEMethodBase,
@@ -297,9 +299,7 @@ class RoutedExperts(PluggableLayer):
         # Update local attributes from ExpertMapManager
         self.update_expert_map_info()
 
-    def set_phase4_residency(
-        self, adapter: Phase4GpuResidencyAdapter | None
-    ) -> None:
+    def set_phase4_residency(self, adapter: Phase4GpuResidencyAdapter | None) -> None:
         """Install the bounded fail-closed adapter without changing the manager."""
         self._phase4_residency = adapter
 
@@ -1239,6 +1239,7 @@ class RoutedExperts(PluggableLayer):
         topk_ids: torch.Tensor,
         shared_experts: "SharedExperts | None" = None,
         shared_experts_input: torch.Tensor | None = None,
+        transient_expert_map: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """
         Execute routed experts using the quantization method's apply function.
@@ -1253,6 +1254,8 @@ class RoutedExperts(PluggableLayer):
             topk_ids: Selected expert IDs from router (for modular kernels)
             shared_experts: The shared experts (if any)
             shared_experts_input: Input for shared experts (if any)
+            transient_expert_map: Request-local residency slot map. It is
+                rejected unless a capable residency adapter is installed.
 
         Returns:
             Output tensor from routed experts.
@@ -1261,15 +1264,40 @@ class RoutedExperts(PluggableLayer):
 
         # Modular kernels use pre-computed routing. The unimplemented Phase 4
         # seam rejects before apply and never rewrites canonical router output.
+        if (
+            transient_expert_map is not None
+            and getattr(self.quant_method, "supports_transient_expert_map", False)
+            is not True
+        ):
+            raise Phase4UnsupportedError(
+                Phase4FailureCategory.UNSUPPORTED_DYNAMIC_MAP,
+                "transient expert map requires a quantization method advertising "
+                "the WNA16 transient map contract",
+            )
         if self._phase4_residency is not None:
-            self._phase4_residency.validate_request(topk_ids, topk_weights)
-        return self.quant_method.apply(
+            if transient_expert_map is None:
+                self._phase4_residency.validate_request(topk_ids, topk_weights)
+            else:
+                self._phase4_residency.validate_request(
+                    topk_ids, topk_weights, transient_expert_map
+                )
+        elif transient_expert_map is not None:
+            raise Phase4UnsupportedError(
+                Phase4FailureCategory.UNSUPPORTED_DYNAMIC_MAP,
+                "transient expert map requires a residency adapter",
+            )
+        apply_kwargs = dict(
             layer=self,
             x=x,
             topk_weights=topk_weights,
             topk_ids=topk_ids,
             shared_experts=shared_experts,
             shared_experts_input=shared_experts_input,
+        )
+        if transient_expert_map is not None:
+            apply_kwargs["transient_expert_map"] = transient_expert_map
+        return self.quant_method.apply(
+            **apply_kwargs,
         )
 
     def forward_monolithic(

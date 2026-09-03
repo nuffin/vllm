@@ -13,9 +13,9 @@ revalidates the exact current lease before outer lifecycle mutation.
 
 from __future__ import annotations
 
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from enum import Enum, auto
-from typing import Callable, Mapping
 
 import torch
 
@@ -535,9 +535,7 @@ class TorchCpuTransferReference:
     ALLOWED_METADATA = REQUIRED_METADATA
 
     @classmethod
-    def transfer(
-        cls, bundle: PostConversionExpertBundle
-    ) -> PostConversionExpertBundle:
+    def transfer(cls, bundle: PostConversionExpertBundle) -> PostConversionExpertBundle:
         """Clone a validated complete bundle onto CPU, or reject it."""
         if not isinstance(bundle, PostConversionExpertBundle):
             raise ValueError("expected a post-conversion expert bundle")
@@ -570,8 +568,7 @@ class TorchCpuTransferReference:
         if bundle.metadata["quantization"] != "WNA16":
             raise ValueError("bundle quantization must be WNA16")
         if any(
-            tuple(t.shape) != tuple(shapes[name])
-            for name, t in bundle.tensors.items()
+            tuple(t.shape) != tuple(shapes[name]) for name, t in bundle.tensors.items()
         ):
             raise ValueError("bundle weight shapes are inconsistent")
         copied = {name: t.detach().clone() for name, t in bundle.tensors.items()}
@@ -621,11 +618,11 @@ class Phase4GpuResidencyAdapter:
                 Phase4FailureCategory.VALIDATION,
                 "only Qwen3-30B-A3B is supported",
             )
-        if self.quantization not in ("AWQ", "WNA16"):
+        if self.quantization != "WNA16":
             return Phase4Capability(
                 False,
                 Phase4FailureCategory.VALIDATION,
-                "only AWQ/WNA16 is supported",
+                "only WNA16 is supported",
             )
         if self.execution_mode != "eager":
             return Phase4Capability(
@@ -652,10 +649,13 @@ class Phase4GpuResidencyAdapter:
         )
 
     def validate_request(
-        self, topk_ids: torch.Tensor, topk_weights: torch.Tensor
+        self,
+        topk_ids: torch.Tensor,
+        topk_weights: torch.Tensor,
+        transient_expert_map: torch.Tensor | None = None,
     ) -> None:
         """Reject before apply; canonical router outputs are never rewritten."""
-        del topk_ids, topk_weights
+        del topk_ids, topk_weights, transient_expert_map
         self.unsupported_requests += 1
         capability = self.capability()
         raise Phase4UnsupportedError(capability.category, capability.reason)
