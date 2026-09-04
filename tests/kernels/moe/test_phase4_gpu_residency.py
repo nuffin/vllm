@@ -36,6 +36,7 @@ from vllm.model_executor.layers.fused_moe.private_wna16_provider import (
     PrivateWNA16ResidencyController,
     _WNA16RequestUseState,
     _WNA16SlotPlanStatus,
+    _WNA16StagedCudaSlot,
     acquire_private_wna16_request_use,
     begin_private_wna16_request_enqueue,
     bind_private_wna16_generation_view_provider,
@@ -136,6 +137,35 @@ def _capture_canonical_cpu_bank(controller, layer, *, symmetric=True):
         symmetric=symmetric,
         group_size=32,
         act_order=False,
+    )
+
+
+def staged_cpu_slot(controller, *, expert_id=0, map_device="cpu"):
+    """Complete CPU fake for the private CUDA-slot staging contract."""
+    bank = controller._canonical_cpu_bank
+    assert bank is not None
+    slots = len(controller._slots)
+    slot_map = torch.full(
+        (bank.global_num_experts,), -1, dtype=torch.int32, device=map_device
+    )
+    if map_device == "cpu":
+        slot_map[expert_id] = 0
+
+    def destination(source):
+        return torch.empty((slots, *source.shape[1:]), dtype=source.dtype)
+
+    return _WNA16StagedCudaSlot(
+        destination(bank.w13_weight_packed),
+        destination(bank.w2_weight_packed),
+        destination(bank.w13_weight_scale),
+        destination(bank.w2_weight_scale),
+        destination(bank.w13_weight_zero_point)
+        if bank.w13_weight_zero_point is not None
+        else None,
+        destination(bank.w2_weight_zero_point)
+        if bank.w2_weight_zero_point is not None
+        else None,
+        slot_map,
     )
 
 
@@ -2854,3 +2884,151 @@ def test_binding_fails_if_factory_closes_its_registration():
             layer_id=3, routed_experts=mocked_routed_experts(adapter)
         )
     assert error.value.category is Phase4FailureCategory.STALE_LEASE
+
+
+def _staging_controller():
+    controller = PrivateWNA16ResidencyController(3, slot_count=2)
+    layer = canonical_cpu_bank_layer()
+    controller(
+        PrivateWNA16ProviderBindingRequest(
+            layer_id=3, routed_experts=cast(RoutedExperts, layer)
+        )
+    )
+    controller.capture_post_conversion(
+        layer=cast(RoutedExperts, layer),
+        backend=WNA16MoEBackend.TRITON,
+        num_bits=4,
+        symmetric=True,
+        group_size=32,
+        act_order=False,
+    )
+    return controller
+
+
+def test_private_cuda_slot_staging_cpu_contract_is_fenced_but_unpublished():
+    class CompleteEvent:
+        def __init__(self):
+            self.recorded = False
+
+        def record(self):
+            self.recorded = True
+
+        def query(self):
+            return True
+
+    controller = _staging_controller()
+    staged = staged_cpu_slot(controller)
+    original_map = staged.slot_map.clone()
+    event = CompleteEvent()
+
+    controller._stage_controller_private_cuda_slot(
+        expert_id=0, staged_slot=staged, fill_event_factory=lambda: event
+    )
+
+    assert event.recorded
+    assert torch.equal(staged.slot_map, original_map)
+    assert len(controller._retained_cpu_source_slots) == 1
+    assert controller._slots[0].state.name == "RESERVED_EMPTY"
+    with pytest.raises(Phase4UnsupportedError, match="not implemented"):
+        controller._request_generation_view(
+            topk_ids=torch.tensor([[0]], dtype=torch.int32),
+            topk_weights=torch.tensor([[1.0]]),
+        )
+    controller._finalize_completed_cpu_source_slot_retentions()
+    assert not controller._retained_cpu_source_slots
+    assert controller._slots[0].state.name == "ABSENT"
+    controller.close()
+
+
+@pytest.mark.parametrize("failure", ["create", "record"])
+def test_private_cuda_slot_staging_rolls_back_event_failures(failure):
+    class RecordFailureEvent:
+        def record(self):
+            raise RuntimeError("record failed")
+
+    controller = _staging_controller()
+    staged = staged_cpu_slot(controller)
+    factory = (
+        (lambda: (_ for _ in ()).throw(RuntimeError("create failed")))
+        if failure == "create"
+        else RecordFailureEvent
+    )
+
+    with pytest.raises(RuntimeError, match=failure):
+        controller._stage_controller_private_cuda_slot(
+            expert_id=0, staged_slot=staged, fill_event_factory=factory
+        )
+
+    assert not controller._reservations
+    assert not controller._retained_cpu_source_slots
+    assert controller._slots[0].state.name == "ABSENT"
+    assert controller._plan_slot_transaction(0).status is _WNA16SlotPlanStatus.RESERVED
+    controller.close()
+
+
+@pytest.mark.parametrize(
+    "primary",
+    [SystemExit("factory exit"), KeyboardInterrupt()],
+    ids=["system-exit", "keyboard-interrupt"],
+)
+def test_private_cuda_slot_staging_rolls_back_base_exceptions(primary):
+    controller = _staging_controller()
+    staged = staged_cpu_slot(controller)
+    event_factory = MagicMock(side_effect=primary)
+
+    with pytest.raises(type(primary)) as caught:
+        controller._stage_controller_private_cuda_slot(
+            expert_id=0, staged_slot=staged, fill_event_factory=event_factory
+        )
+
+    assert caught.value is primary
+    assert not controller._reservations
+    assert not controller._retained_cpu_source_slots
+    assert controller._slots[0].state.name == "ABSENT"
+    reservation = controller._plan_slot_transaction(0).reservation
+    assert reservation is not None
+    controller._rollback_slot_transaction(reservation)
+    controller.close()
+
+
+def test_private_cuda_slot_staging_rejects_incomplete_map_before_event():
+    controller = _staging_controller()
+    staged = staged_cpu_slot(controller)
+    staged.slot_map[0] = -1
+    event_factory = MagicMock()
+
+    with pytest.raises(Phase4UnsupportedError, match="slot map is incomplete"):
+        controller._stage_controller_private_cuda_slot(
+            expert_id=0, staged_slot=staged, fill_event_factory=event_factory
+        )
+
+    event_factory.assert_not_called()
+    assert not controller._reservations
+    assert not controller._retained_cpu_source_slots
+    assert controller._slots[0].state.name == "ABSENT"
+    controller.close()
+
+
+def test_private_cuda_slot_staging_rejects_non_cpu_map_before_read():
+    controller = _staging_controller()
+    staged = staged_cpu_slot(controller, map_device="meta")
+    event_factory = MagicMock()
+
+    with pytest.raises(Phase4UnsupportedError, match="must be CPU-resident"):
+        controller._stage_controller_private_cuda_slot(
+            expert_id=0, staged_slot=staged, fill_event_factory=event_factory
+        )
+
+    event_factory.assert_not_called()
+    assert not controller._reservations
+    assert not controller._retained_cpu_source_slots
+    assert controller._slots[0].state.name == "ABSENT"
+    controller.close()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")
+def test_private_wna16_cuda_abi_preflight_only():
+    """ABI preflight only; no CUDA execution, H2D, residency, or parity proof."""
+    assert callable(torch.cuda.Event)
+    assert callable(torch.cuda.is_current_stream_capturing)
+    assert callable(FusedMoEKernelModularImpl.apply_private_wna16)

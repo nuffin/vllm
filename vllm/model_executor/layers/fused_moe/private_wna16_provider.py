@@ -12,6 +12,7 @@ outputs, so it cannot truthfully be implemented as a static model tensor view.
 from __future__ import annotations
 
 from collections.abc import Callable
+from contextlib import suppress
 from dataclasses import dataclass
 from enum import Enum, auto
 from threading import RLock
@@ -128,6 +129,24 @@ class _WNA16CpuSourceSlotRetention:
     reservation: _WNA16SlotReservation
     completion: object
     token: object
+
+
+@dataclass(frozen=True, slots=True)
+class _WNA16StagedCudaSlot:
+    """Controller-private destination ABI for future CUDA slot publication.
+
+    This is deliberately only a staging boundary. It validates a complete
+    controller-owned destination bundle and map before retaining the CPU source,
+    but neither allocates CUDA storage nor exposes a generation view.
+    """
+
+    w13_weight_packed: torch.Tensor
+    w2_weight_packed: torch.Tensor
+    w13_weight_scale: torch.Tensor
+    w2_weight_scale: torch.Tensor
+    w13_weight_zero_point: torch.Tensor | None
+    w2_weight_zero_point: torch.Tensor | None
+    slot_map: torch.Tensor
 
 
 @dataclass(frozen=True, slots=True)
@@ -854,6 +873,136 @@ class PrivateWNA16ResidencyController:
             )
             self._retained_cpu_source_slots[retention.token] = retention
             return retention
+
+    def _stage_controller_private_cuda_slot(
+        self,
+        *,
+        expert_id: int,
+        staged_slot: _WNA16StagedCudaSlot,
+        fill_event_factory: Callable[[], object],
+    ) -> None:
+        """Validate and fence a complete private slot without publishing it.
+
+        This controller-private seam has no production caller. In particular it
+        does not allocate, copy, synchronize, change a map, mark a slot
+        resident, or return a ``WNA16GenerationView``. A real H2D implementation
+        must add those operations atomically with controller-owned CUDA storage.
+        """
+        reservation: _WNA16SlotReservation | None = None
+        try:
+            plan = self._plan_slot_transaction(expert_id)
+            if plan.status is not _WNA16SlotPlanStatus.RESERVED:
+                raise _lifecycle_error(
+                    "private WNA16 CUDA slot staging requires an empty slot"
+                )
+            reservation = plan.reservation
+            if reservation is None:
+                raise _lifecycle_error("private WNA16 slot reservation is missing")
+            self._validate_staged_cuda_slot(reservation, staged_slot)
+            if not callable(fill_event_factory):
+                raise _lifecycle_error(
+                    "private WNA16 CUDA fill event factory must be callable"
+                )
+            event = fill_event_factory()
+            record = getattr(event, "record", None)
+            if not callable(record):
+                raise _lifecycle_error(
+                    "private WNA16 CUDA fill event has no callable record"
+                )
+            record()
+            self._retain_cpu_source_slot_until_completion(reservation, event)
+        except BaseException:
+            if reservation is not None:
+                with suppress(BaseException):
+                    self._rollback_slot_transaction(reservation)
+            raise
+
+    def _validate_staged_cuda_slot(
+        self,
+        reservation: _WNA16SlotReservation,
+        staged_slot: _WNA16StagedCudaSlot,
+    ) -> None:
+        """Validate all destination operands/map before a fill event is recorded."""
+        with self._lifecycle_lock:
+            bank = self._canonical_cpu_bank
+            if (
+                self._closed
+                or bank is None
+                or self._reservations.get(reservation.token) is not reservation
+                or reservation.slot >= len(self._slots)
+            ):
+                raise _lifecycle_error(
+                    "private WNA16 CUDA slot staging is stale", stale=True
+                )
+            expected = (
+                (bank.w13_weight_packed, staged_slot.w13_weight_packed),
+                (bank.w2_weight_packed, staged_slot.w2_weight_packed),
+                (bank.w13_weight_scale, staged_slot.w13_weight_scale),
+                (bank.w2_weight_scale, staged_slot.w2_weight_scale),
+            )
+            optional_expected = (
+                (bank.w13_weight_zero_point, staged_slot.w13_weight_zero_point),
+                (bank.w2_weight_zero_point, staged_slot.w2_weight_zero_point),
+            )
+            destination_device: torch.device | None = None
+            for source, destination in expected:
+                if (
+                    not isinstance(destination, torch.Tensor)
+                    or destination.dtype is not source.dtype
+                    or destination.ndim != source.ndim
+                    or destination.shape[0] != len(self._slots)
+                    or tuple(destination.shape[1:]) != tuple(source.shape[1:])
+                ):
+                    raise _lifecycle_error(
+                        "private WNA16 CUDA destination operands are incomplete"
+                    )
+                if destination_device is None:
+                    destination_device = destination.device
+                elif destination.device != destination_device:
+                    raise _lifecycle_error(
+                        "private WNA16 CUDA destination operands disagree on device"
+                    )
+            for source, destination in optional_expected:
+                if (source is None) != (destination is None):
+                    raise _lifecycle_error(
+                        "private WNA16 CUDA destination zero points are incomplete"
+                    )
+                if (
+                    source is not None
+                    and destination is not None
+                    and (
+                        destination.dtype is not source.dtype
+                        or destination.ndim != source.ndim
+                        or destination.shape[0] != len(self._slots)
+                        or tuple(destination.shape[1:]) != tuple(source.shape[1:])
+                        or destination.device != destination_device
+                    )
+                ):
+                    raise _lifecycle_error(
+                        "private WNA16 CUDA destination zero points are invalid"
+                    )
+            slot_map = staged_slot.slot_map
+            if (
+                not isinstance(slot_map, torch.Tensor)
+                or slot_map.dtype is not torch.int32
+                or slot_map.ndim != 1
+                or slot_map.shape[0] != bank.global_num_experts
+            ):
+                raise _lifecycle_error("private WNA16 CUDA slot map is invalid")
+            if slot_map.device.type != "cpu":
+                raise _lifecycle_error(
+                    "private WNA16 CUDA slot map must be CPU-resident"
+                )
+            if slot_map.device != destination_device:
+                raise _lifecycle_error("private WNA16 CUDA slot map is invalid")
+            values = slot_map.tolist()
+            if (
+                values[reservation.expert_id] != reservation.slot
+                or any(value < -1 or value >= len(self._slots) for value in values)
+                or len({value for value in values if value >= 0})
+                != sum(value >= 0 for value in values)
+            ):
+                raise _lifecycle_error("private WNA16 CUDA slot map is incomplete")
 
     def _finalize_completed_cpu_source_slot_retentions(self) -> None:
         """Poll CPU-only completion predicates without holding lifecycle ownership."""
