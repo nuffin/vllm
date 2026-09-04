@@ -169,6 +169,32 @@ def staged_cpu_slot(controller, *, expert_id=0, map_device="cpu"):
     )
 
 
+def staged_cuda_slot(controller, *, expert_id=0):
+    """CUDA-only destination capability for ABI preflight; it enqueues no copy."""
+    bank = controller._canonical_cpu_bank
+    assert bank is not None
+    slots = len(controller._slots)
+
+    def destination(source):
+        return torch.empty(
+            (slots, *source.shape[1:]), device="cuda", dtype=source.dtype
+        )
+
+    return _WNA16StagedCudaSlot(
+        destination(bank.w13_weight_packed),
+        destination(bank.w2_weight_packed),
+        destination(bank.w13_weight_scale),
+        destination(bank.w2_weight_scale),
+        destination(bank.w13_weight_zero_point)
+        if bank.w13_weight_zero_point is not None
+        else None,
+        destination(bank.w2_weight_zero_point)
+        if bank.w2_weight_zero_point is not None
+        else None,
+        torch.full((bank.global_num_experts,), -1, device="cuda", dtype=torch.int32),
+    )
+
+
 def unbound_private_view() -> WNA16GenerationView:
     """A public ABI view has snapshots but cannot issue private storage."""
     view = private_view()
@@ -3026,9 +3052,70 @@ def test_private_cuda_slot_staging_rejects_non_cpu_map_before_read():
     controller.close()
 
 
+def test_private_cuda_slot_cpu_fake_partial_copy_failure_rolls_back_capacity():
+    """CPU fake only: a partial copy cannot publish or retain a slot."""
+    controller = _staging_controller()
+    staged = staged_cpu_slot(controller)
+    copied: list[int] = []
+
+    def partial_copy(_, __, slot: int) -> None:
+        copied.append(slot)
+        if len(copied) == 2:
+            raise RuntimeError("partial copy failed")
+
+    with pytest.raises(RuntimeError, match="partial copy failed"):
+        controller._stage_controller_private_cuda_slot(
+            expert_id=0,
+            staged_slot=staged,
+            fill_event_factory=MagicMock(),
+            payload_copy=partial_copy,
+        )
+
+    assert copied == [0, 0]
+    assert not controller._reservations
+    assert not controller._retained_cpu_source_slots
+    assert controller._slots[0].state.name == "ABSENT"
+    controller.close()
+
+
+def test_private_cuda_h2d_cpu_control_map_builds_fresh_candidate_and_rolls_back():
+    """CPU contract only; it proves no CUDA copy, event, or publication."""
+    controller = _staging_controller()
+    try:
+        controller._seed_logical_resident_for_test(1, 2)
+        plan = controller._plan_slot_transaction(0)
+        assert plan.reservation is not None
+        candidate = controller._build_cpu_candidate_slot_map(plan.reservation)
+        assert candidate.device.type == "cpu"
+        assert candidate.dtype is torch.int32
+        assert candidate.is_contiguous()
+        assert candidate.tolist() == [0, -1, 1, -1]
+        controller._rollback_slot_transaction(plan.reservation)
+        assert controller._slots[0].state.name == "ABSENT"
+    finally:
+        controller.close()
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")
 def test_private_wna16_cuda_abi_preflight_only():
-    """ABI preflight only; no CUDA execution, H2D, residency, or parity proof."""
-    assert callable(torch.cuda.Event)
-    assert callable(torch.cuda.is_current_stream_capturing)
-    assert callable(FusedMoEKernelModularImpl.apply_private_wna16)
+    """ABI preflight only; no H2D, event, residency, execution, or parity proof."""
+    controller = _staging_controller()
+    try:
+        staged = staged_cuda_slot(controller)
+        with patch.object(torch.Tensor, "tolist", side_effect=AssertionError):
+            plan = controller._plan_slot_transaction(0)
+            assert plan.reservation is not None
+            controller._validate_cuda_h2d_destination(plan.reservation, staged)
+            controller._rollback_slot_transaction(plan.reservation)
+        transaction = controller._prepare_controller_private_cuda_h2d_transaction(
+            expert_id=0, staged_slot=staged
+        )
+        assert transaction.candidate_cpu_slot_map.tolist() == [0, -1, -1, -1]
+        assert transaction.staged_slot.slot_map.is_cuda
+        assert not controller._retained_cpu_source_slots
+        controller._rollback_prepared_controller_private_cuda_h2d_transaction(
+            transaction
+        )
+        assert controller._slots[0].state.name == "ABSENT"
+    finally:
+        controller.close()

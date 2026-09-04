@@ -150,6 +150,21 @@ class _WNA16StagedCudaSlot:
 
 
 @dataclass(frozen=True, slots=True)
+class _WNA16PreparedCudaH2DTransaction:
+    """Unpublished CUDA H2D ABI boundary with a CPU-validated control map.
+
+    This records no CUDA work. A future controller-owned enqueue implementation
+    must consume this exact reservation and never read device data on the host.
+    """
+
+    controller: object
+    reservation: _WNA16SlotReservation
+    candidate_cpu_slot_map: torch.Tensor
+    staged_slot: _WNA16StagedCudaSlot
+    token: object
+
+
+@dataclass(frozen=True, slots=True)
 class _WNA16SlotPlan:
     status: _WNA16SlotPlanStatus
     slot: int | None
@@ -880,6 +895,7 @@ class PrivateWNA16ResidencyController:
         expert_id: int,
         staged_slot: _WNA16StagedCudaSlot,
         fill_event_factory: Callable[[], object],
+        payload_copy: Callable[[torch.Tensor, torch.Tensor, int], None] | None = None,
     ) -> None:
         """Validate and fence a complete private slot without publishing it.
 
@@ -899,6 +915,27 @@ class PrivateWNA16ResidencyController:
             if reservation is None:
                 raise _lifecycle_error("private WNA16 slot reservation is missing")
             self._validate_staged_cuda_slot(reservation, staged_slot)
+            if payload_copy is not None:
+                if not callable(payload_copy):
+                    raise _lifecycle_error(
+                        "private WNA16 CPU staging payload copy must be callable"
+                    )
+                bank = self._canonical_cpu_bank
+                if bank is None:
+                    raise _lifecycle_error(
+                        "private WNA16 CPU staging is stale", stale=True
+                    )
+                for source, destination in (
+                    (bank.w13_weight_packed, staged_slot.w13_weight_packed),
+                    (bank.w2_weight_packed, staged_slot.w2_weight_packed),
+                    (bank.w13_weight_scale, staged_slot.w13_weight_scale),
+                    (bank.w2_weight_scale, staged_slot.w2_weight_scale),
+                ):
+                    payload_copy(
+                        source[expert_id],
+                        destination[reservation.slot],
+                        reservation.slot,
+                    )
             if not callable(fill_event_factory):
                 raise _lifecycle_error(
                     "private WNA16 CUDA fill event factory must be callable"
@@ -916,6 +953,162 @@ class PrivateWNA16ResidencyController:
                 with suppress(BaseException):
                     self._rollback_slot_transaction(reservation)
             raise
+
+    def _prepare_controller_private_cuda_h2d_transaction(
+        self, *, expert_id: int, staged_slot: _WNA16StagedCudaSlot
+    ) -> _WNA16PreparedCudaH2DTransaction:
+        """Validate an unpublished CUDA destination before any H2D enqueue.
+
+        This deliberately stops before allocation, streams, copies, events,
+        publication, and generation-view issuance. The downstream private ABI
+        cannot yet safely publish a CUDA map without its controller authority.
+        """
+        reservation: _WNA16SlotReservation | None = None
+        try:
+            plan = self._plan_slot_transaction(expert_id)
+            if plan.status is not _WNA16SlotPlanStatus.RESERVED:
+                raise _lifecycle_error(
+                    "private WNA16 CUDA H2D preparation requires an empty slot"
+                )
+            reservation = plan.reservation
+            if reservation is None:
+                raise _lifecycle_error("private WNA16 slot reservation is missing")
+            candidate = self._build_cpu_candidate_slot_map(reservation)
+            self._validate_cuda_h2d_destination(reservation, staged_slot)
+            return _WNA16PreparedCudaH2DTransaction(
+                self, reservation, candidate, staged_slot, object()
+            )
+        except BaseException:
+            if reservation is not None:
+                with suppress(BaseException):
+                    self._rollback_slot_transaction(reservation)
+            raise
+
+    def _rollback_prepared_controller_private_cuda_h2d_transaction(
+        self, transaction: _WNA16PreparedCudaH2DTransaction
+    ) -> None:
+        """Release a pre-enqueue ABI reservation with no CUDA ownership."""
+        if (
+            not isinstance(transaction, _WNA16PreparedCudaH2DTransaction)
+            or transaction.controller is not self
+        ):
+            raise _lifecycle_error(
+                "private WNA16 CUDA H2D transaction is stale", stale=True
+            )
+        self._rollback_slot_transaction(transaction.reservation)
+
+    def _build_cpu_candidate_slot_map(
+        self, reservation: _WNA16SlotReservation
+    ) -> torch.Tensor:
+        """Build and validate the only host-readable control-map candidate."""
+        with self._lifecycle_lock:
+            bank = self._canonical_cpu_bank
+            if (
+                self._closed
+                or bank is None
+                or self._reservations.get(reservation.token) is not reservation
+            ):
+                raise _lifecycle_error(
+                    "private WNA16 CPU control map is stale", stale=True
+                )
+            candidate = torch.full(
+                (bank.global_num_experts,), -1, dtype=torch.int32, device="cpu"
+            )
+            for slot_index, slot in enumerate(self._slots):
+                if slot.state is _WNA16SlotState.RESIDENT:
+                    if slot.expert_id is None:
+                        raise _lifecycle_error(
+                            "private WNA16 CPU control map is invalid"
+                        )
+                    candidate[slot.expert_id] = slot_index
+            candidate[reservation.expert_id] = reservation.slot
+            values = candidate.tolist()
+            if (
+                not candidate.is_contiguous()
+                or candidate.dtype is not torch.int32
+                or any(value < -1 or value >= len(self._slots) for value in values)
+                or len({value for value in values if value >= 0})
+                != sum(value >= 0 for value in values)
+                or values[reservation.expert_id] != reservation.slot
+            ):
+                raise _lifecycle_error("private WNA16 CPU control map is invalid")
+            return candidate
+
+    def _validate_cuda_h2d_destination(
+        self,
+        reservation: _WNA16SlotReservation,
+        staged_slot: _WNA16StagedCudaSlot,
+    ) -> None:
+        """Check CUDA metadata only; never read payload or map contents on host."""
+        with self._lifecycle_lock:
+            bank = self._canonical_cpu_bank
+            if (
+                self._closed
+                or bank is None
+                or self._reservations.get(reservation.token) is not reservation
+            ):
+                raise _lifecycle_error(
+                    "private WNA16 CUDA H2D destination is stale", stale=True
+                )
+            destination_device: torch.device | None = None
+            required = (
+                (bank.w13_weight_packed, staged_slot.w13_weight_packed),
+                (bank.w2_weight_packed, staged_slot.w2_weight_packed),
+                (bank.w13_weight_scale, staged_slot.w13_weight_scale),
+                (bank.w2_weight_scale, staged_slot.w2_weight_scale),
+            )
+            for source, destination in required:
+                if (
+                    not destination.is_cuda
+                    or not destination.is_contiguous()
+                    or destination.dtype is not source.dtype
+                    or destination.ndim != source.ndim
+                    or destination.shape[0] != len(self._slots)
+                    or tuple(destination.shape[1:]) != tuple(source.shape[1:])
+                ):
+                    raise _lifecycle_error(
+                        "private WNA16 CUDA H2D destination operands are incomplete"
+                    )
+                if destination_device is None:
+                    destination_device = destination.device
+                elif destination.device != destination_device:
+                    raise _lifecycle_error(
+                        "private WNA16 CUDA H2D destination operands disagree on device"
+                    )
+            for source, destination in (
+                (bank.w13_weight_zero_point, staged_slot.w13_weight_zero_point),
+                (bank.w2_weight_zero_point, staged_slot.w2_weight_zero_point),
+            ):
+                if (source is None) != (destination is None):
+                    raise _lifecycle_error(
+                        "private WNA16 CUDA destination zero points are incomplete"
+                    )
+                if (
+                    source is not None
+                    and destination is not None
+                    and (
+                        not destination.is_cuda
+                        or not destination.is_contiguous()
+                        or destination.dtype is not source.dtype
+                        or destination.shape != (len(self._slots), *source.shape[1:])
+                        or destination.device != destination_device
+                    )
+                ):
+                    raise _lifecycle_error(
+                        "private WNA16 CUDA destination zero points are invalid"
+                    )
+            slot_map = staged_slot.slot_map
+            if (
+                not slot_map.is_cuda
+                or not slot_map.is_contiguous()
+                or slot_map.dtype is not torch.int32
+                or slot_map.ndim != 1
+                or slot_map.shape[0] != bank.global_num_experts
+                or slot_map.device != destination_device
+            ):
+                raise _lifecycle_error(
+                    "private WNA16 CUDA H2D destination map is invalid"
+                )
 
     def _validate_staged_cuda_slot(
         self,
