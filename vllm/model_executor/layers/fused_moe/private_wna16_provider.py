@@ -81,6 +81,51 @@ class _CanonicalWNA16CpuBank:
     w2_weight_zero_point: torch.Tensor | None
 
 
+class _WNA16SlotState(Enum):
+    ABSENT = auto()
+    RESERVED_EMPTY = auto()
+    RESIDENT = auto()
+    STAGED_REPLACEMENT = auto()
+
+
+class _WNA16SlotPlanStatus(Enum):
+    HIT = auto()
+    RESERVED = auto()
+    FALLBACK = auto()
+
+
+@dataclass(slots=True)
+class _WNA16LogicalSlot:
+    state: _WNA16SlotState = _WNA16SlotState.ABSENT
+    expert_id: int | None = None
+    pins: int = 0
+    last_used: int = 0
+
+
+@dataclass(frozen=True, slots=True)
+class _WNA16LogicalSlotSnapshot:
+    state: _WNA16SlotState
+    expert_id: int | None
+    pins: int
+    last_used: int
+
+
+@dataclass(frozen=True, slots=True)
+class _WNA16SlotReservation:
+    controller: object
+    slot: int
+    expert_id: int
+    token: object
+    previous_slot: _WNA16LogicalSlotSnapshot
+
+
+@dataclass(frozen=True, slots=True)
+class _WNA16SlotPlan:
+    status: _WNA16SlotPlanStatus
+    slot: int | None
+    reservation: _WNA16SlotReservation | None = None
+
+
 def _copy_canonical_wna16_cpu_operand(tensor: torch.Tensor) -> torch.Tensor:
     return tensor.detach().to(device="cpu").clone().contiguous()
 
@@ -550,11 +595,17 @@ class _RevocablePrivateWNA16Provider:
 class PrivateWNA16ResidencyController:
     """Per-worker placeholder for the future CPU-to-GPU transfer controller."""
 
-    def __init__(self, layer_id: int) -> None:
+    def __init__(self, layer_id: int, *, slot_count: int | None = None) -> None:
+        if slot_count is not None and slot_count <= 0:
+            raise ValueError("private WNA16 slot count must be positive")
         self._lifecycle_lock = RLock()
         self._layer_id = layer_id
         self._bound_routed_experts: RoutedExperts | None = None
         self._canonical_cpu_bank: _CanonicalWNA16CpuBank | None = None
+        self._slot_count = slot_count
+        self._slots: list[_WNA16LogicalSlot] = []
+        self._slot_clock = 0
+        self._reservations: dict[object, _WNA16SlotReservation] = {}
         self._closed = False
 
     def __call__(
@@ -674,12 +725,145 @@ class PrivateWNA16ResidencyController:
                     "private WNA16 canonical CPU copy failed"
                 ) from error
             self._canonical_cpu_bank = bank
+            self._slots = [
+                _WNA16LogicalSlot()
+                for _ in range(min(self._slot_count or 0, bank.global_num_experts))
+            ]
+
+    def _plan_slot_transaction(self, expert_id: int) -> _WNA16SlotPlan:
+        """Reserve a logical future slot without allocating or copying to CUDA."""
+        with self._lifecycle_lock:
+            bank = self._canonical_cpu_bank
+            if self._closed or bank is None or not self._slots:
+                raise _lifecycle_error("private WNA16 slot planning is unavailable")
+            if expert_id < 0 or expert_id >= bank.global_num_experts:
+                raise _lifecycle_error("private WNA16 slot expert is invalid")
+            for index, slot in enumerate(self._slots):
+                if (
+                    slot.state is _WNA16SlotState.RESIDENT
+                    and slot.expert_id == expert_id
+                ):
+                    self._touch_slot(slot)
+                    return _WNA16SlotPlan(_WNA16SlotPlanStatus.HIT, index)
+            empty = next(
+                (
+                    index
+                    for index, slot in enumerate(self._slots)
+                    if slot.state is _WNA16SlotState.ABSENT
+                ),
+                None,
+            )
+            if empty is None:
+                candidates = [
+                    (slot.last_used, index)
+                    for index, slot in enumerate(self._slots)
+                    if slot.state is _WNA16SlotState.RESIDENT and slot.pins == 0
+                ]
+                if not candidates:
+                    return _WNA16SlotPlan(_WNA16SlotPlanStatus.FALLBACK, None)
+                _, empty = min(candidates)
+                victim = self._slots[empty]
+                previous_slot = self._snapshot_slot(victim)
+                victim.state = _WNA16SlotState.STAGED_REPLACEMENT
+            else:
+                victim = self._slots[empty]
+                previous_slot = self._snapshot_slot(victim)
+                victim.state = _WNA16SlotState.RESERVED_EMPTY
+            reservation = _WNA16SlotReservation(
+                self, empty, expert_id, object(), previous_slot
+            )
+            self._reservations[reservation.token] = reservation
+            return _WNA16SlotPlan(_WNA16SlotPlanStatus.RESERVED, empty, reservation)
+
+    def _rollback_slot_transaction(self, reservation: _WNA16SlotReservation) -> None:
+        """Rollback the exact reservation; CPU planning never commits a fill."""
+        with self._lifecycle_lock:
+            if (
+                reservation.controller is not self
+                or self._closed
+                or self._reservations.get(reservation.token) is not reservation
+            ):
+                raise _lifecycle_error(
+                    "private WNA16 slot reservation is stale", stale=True
+                )
+            if reservation.slot >= len(self._slots):
+                raise _lifecycle_error(
+                    "private WNA16 slot reservation is stale", stale=True
+                )
+            slot = self._slots[reservation.slot]
+            expected_state = (
+                _WNA16SlotState.RESERVED_EMPTY
+                if reservation.previous_slot.state is _WNA16SlotState.ABSENT
+                else _WNA16SlotState.STAGED_REPLACEMENT
+            )
+            if slot.state is not expected_state:
+                raise _lifecycle_error(
+                    "private WNA16 slot reservation is stale", stale=True
+                )
+            self._reservations.pop(reservation.token)
+            late_pins = slot.pins - reservation.previous_slot.pins
+            self._slots[reservation.slot] = _WNA16LogicalSlot(
+                state=reservation.previous_slot.state,
+                expert_id=reservation.previous_slot.expert_id,
+                pins=reservation.previous_slot.pins + max(late_pins, 0),
+                last_used=reservation.previous_slot.last_used,
+            )
+
+    def _seed_logical_resident_for_test(
+        self, slot_index: int, expert_id: int, *, last_used: int = 0
+    ) -> None:
+        """Install CPU-only logical test state without a transfer or mapping change."""
+        with self._lifecycle_lock:
+            bank = self._canonical_cpu_bank
+            if self._closed or bank is None or not self._slots:
+                raise _lifecycle_error("private WNA16 slot planning is unavailable")
+            if not 0 <= slot_index < len(self._slots):
+                raise _lifecycle_error("private WNA16 slot index is invalid")
+            if not 0 <= expert_id < bank.global_num_experts:
+                raise _lifecycle_error("private WNA16 slot expert is invalid")
+            if self._slots[slot_index].state is not _WNA16SlotState.ABSENT:
+                raise _lifecycle_error("private WNA16 logical slot is occupied")
+            self._slots[slot_index] = _WNA16LogicalSlot(
+                state=_WNA16SlotState.RESIDENT,
+                expert_id=expert_id,
+                last_used=last_used,
+            )
+            self._slot_clock = max(self._slot_clock, last_used)
+
+    def _acquire_logical_resident_pin_for_test(self, expert_id: int) -> None:
+        """Acquire a CPU-only logical pin, including a staged victim."""
+        with self._lifecycle_lock:
+            if self._closed:
+                raise _lifecycle_error("private WNA16 slot planning is unavailable")
+            for slot in self._slots:
+                if slot.expert_id == expert_id and slot.state in (
+                    _WNA16SlotState.RESIDENT,
+                    _WNA16SlotState.STAGED_REPLACEMENT,
+                ):
+                    slot.pins += 1
+                    return
+            raise _lifecycle_error("private WNA16 logical resident is unavailable")
+
+    @staticmethod
+    def _snapshot_slot(slot: _WNA16LogicalSlot) -> _WNA16LogicalSlotSnapshot:
+        return _WNA16LogicalSlotSnapshot(
+            state=slot.state,
+            expert_id=slot.expert_id,
+            pins=slot.pins,
+            last_used=slot.last_used,
+        )
+
+    def _touch_slot(self, slot: _WNA16LogicalSlot) -> None:
+        self._slot_clock += 1
+        slot.last_used = self._slot_clock
 
     def close(self) -> None:
         with self._lifecycle_lock:
             self._closed = True
             self._canonical_cpu_bank = None
             self._bound_routed_experts = None
+            self._slots.clear()
+            self._reservations.clear()
 
     def _request_generation_view(
         self,

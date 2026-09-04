@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+from dataclasses import replace
 from threading import Event, Thread
 from types import SimpleNamespace
 from typing import cast
@@ -34,6 +35,7 @@ from vllm.model_executor.layers.fused_moe.private_wna16_provider import (
     PrivateWNA16ProviderBindingRequest,
     PrivateWNA16ResidencyController,
     _WNA16RequestUseState,
+    _WNA16SlotPlanStatus,
     acquire_private_wna16_request_use,
     begin_private_wna16_request_enqueue,
     bind_private_wna16_generation_view_provider,
@@ -390,6 +392,198 @@ def test_generic_provider_factory_close_is_not_a_lifecycle_callback():
     registration.close()
 
     assert factory.closed is False
+
+
+def test_cpu_slot_planner_reserves_rolls_back_and_rejects_stale_leases():
+    controller = PrivateWNA16ResidencyController(layer_id=3, slot_count=1)
+    registration = register_private_wna16_provider_factory(controller)
+    layer = canonical_cpu_bank_layer()
+    try:
+        _capture_canonical_cpu_bank(controller, layer)
+
+        plan = controller._plan_slot_transaction(2)
+        assert plan.status is _WNA16SlotPlanStatus.RESERVED
+        assert plan.slot == 0
+        assert plan.reservation is not None
+        blocked = controller._plan_slot_transaction(1)
+        assert blocked.status is _WNA16SlotPlanStatus.FALLBACK
+        assert blocked.slot is None
+        controller._rollback_slot_transaction(plan.reservation)
+        assert controller._slots[0].state.name == "ABSENT"
+        with pytest.raises(Phase4UnsupportedError, match="stale") as error:
+            controller._rollback_slot_transaction(plan.reservation)
+        assert error.value.category is Phase4FailureCategory.STALE_LEASE
+    finally:
+        registration.close()
+
+
+def test_cpu_slot_planner_is_disabled_without_private_capacity_or_after_close():
+    controller = PrivateWNA16ResidencyController(layer_id=3)
+    registration = register_private_wna16_provider_factory(controller)
+    layer = canonical_cpu_bank_layer()
+    try:
+        _capture_canonical_cpu_bank(controller, layer)
+        with pytest.raises(Phase4UnsupportedError, match="unavailable"):
+            controller._plan_slot_transaction(0)
+    finally:
+        registration.close()
+    with pytest.raises(Phase4UnsupportedError, match="unavailable"):
+        controller._plan_slot_transaction(0)
+
+
+def test_cpu_slot_planner_hits_and_deterministically_rolls_back_lru_victim():
+    controller = PrivateWNA16ResidencyController(layer_id=3, slot_count=2)
+    registration = register_private_wna16_provider_factory(controller)
+    try:
+        _capture_canonical_cpu_bank(controller, canonical_cpu_bank_layer())
+        controller._seed_logical_resident_for_test(0, 1, last_used=10)
+        controller._seed_logical_resident_for_test(1, 2, last_used=4)
+        before_hit = controller._slots[0].last_used
+
+        hit = controller._plan_slot_transaction(1)
+        assert hit.status is _WNA16SlotPlanStatus.HIT
+        assert hit.slot == 0
+        assert hit.reservation is None
+        assert controller._slots[0].expert_id == 1
+        assert controller._slots[0].pins == 0
+        assert controller._slots[0].last_used > before_hit
+
+        plan = controller._plan_slot_transaction(3)
+        assert plan.status is _WNA16SlotPlanStatus.RESERVED
+        assert plan.slot == 1
+        assert plan.reservation is not None
+        assert controller._slots[1].state.name == "STAGED_REPLACEMENT"
+        assert controller._slots[1].expert_id == 2
+        controller._rollback_slot_transaction(plan.reservation)
+        assert (
+            controller._slots[1].state.name,
+            controller._slots[1].expert_id,
+            controller._slots[1].pins,
+            controller._slots[1].last_used,
+        ) == ("RESIDENT", 2, 0, 4)
+    finally:
+        registration.close()
+
+
+def test_cpu_slot_planner_tie_breaks_equal_recency_by_lowest_slot_index():
+    controller = PrivateWNA16ResidencyController(layer_id=3, slot_count=2)
+    registration = register_private_wna16_provider_factory(controller)
+    try:
+        _capture_canonical_cpu_bank(controller, canonical_cpu_bank_layer())
+        controller._seed_logical_resident_for_test(0, 1, last_used=4)
+        controller._seed_logical_resident_for_test(1, 2, last_used=4)
+
+        plan = controller._plan_slot_transaction(3)
+
+        assert plan.status is _WNA16SlotPlanStatus.RESERVED
+        assert plan.slot == 0
+        assert plan.reservation is not None
+        controller._rollback_slot_transaction(plan.reservation)
+    finally:
+        registration.close()
+
+
+def test_cpu_slot_planner_pinned_or_staged_slots_fall_back_without_mutation():
+    controller = PrivateWNA16ResidencyController(layer_id=3, slot_count=1)
+    registration = register_private_wna16_provider_factory(controller)
+    try:
+        _capture_canonical_cpu_bank(controller, canonical_cpu_bank_layer())
+        controller._seed_logical_resident_for_test(0, 1, last_used=7)
+        controller._acquire_logical_resident_pin_for_test(1)
+        before = replace(controller._slots[0])
+        before_clock = controller._slot_clock
+
+        plan = controller._plan_slot_transaction(2)
+        assert plan.status is _WNA16SlotPlanStatus.FALLBACK
+        assert plan.slot is None
+        assert plan.reservation is None
+        assert controller._slots[0] == before
+        assert controller._slot_clock == before_clock
+    finally:
+        registration.close()
+
+
+def test_cpu_slot_planner_staged_fallback_preserves_all_private_state():
+    controller = PrivateWNA16ResidencyController(layer_id=3, slot_count=1)
+    registration = register_private_wna16_provider_factory(controller)
+    try:
+        _capture_canonical_cpu_bank(controller, canonical_cpu_bank_layer())
+        controller._seed_logical_resident_for_test(0, 1, last_used=7)
+        staged = controller._plan_slot_transaction(2)
+        assert staged.reservation is not None
+        slots_before = [replace(slot) for slot in controller._slots]
+        clock_before = controller._slot_clock
+        reservations_before = dict(controller._reservations)
+
+        fallback = controller._plan_slot_transaction(3)
+
+        assert fallback.status is _WNA16SlotPlanStatus.FALLBACK
+        assert fallback.slot is None
+        assert fallback.reservation is None
+        assert controller._slots == slots_before
+        assert controller._slot_clock == clock_before
+        assert controller._reservations == reservations_before
+        controller._rollback_slot_transaction(staged.reservation)
+    finally:
+        registration.close()
+
+
+def test_cpu_slot_planner_rejects_forged_reservation_without_consuming_it():
+    controller = PrivateWNA16ResidencyController(layer_id=3, slot_count=1)
+    registration = register_private_wna16_provider_factory(controller)
+    try:
+        _capture_canonical_cpu_bank(controller, canonical_cpu_bank_layer())
+        plan = controller._plan_slot_transaction(2)
+        assert plan.reservation is not None
+        forged = replace(plan.reservation)
+        with pytest.raises(Phase4UnsupportedError) as error:
+            controller._rollback_slot_transaction(forged)
+        assert error.value.category is Phase4FailureCategory.STALE_LEASE
+        assert len(controller._reservations) == 1
+        controller._rollback_slot_transaction(plan.reservation)
+    finally:
+        registration.close()
+
+
+def test_cpu_slot_planner_late_pin_restores_victim_without_eviction():
+    controller = PrivateWNA16ResidencyController(layer_id=3, slot_count=1)
+    registration = register_private_wna16_provider_factory(controller)
+    try:
+        _capture_canonical_cpu_bank(controller, canonical_cpu_bank_layer())
+        controller._seed_logical_resident_for_test(0, 1, last_used=4)
+        plan = controller._plan_slot_transaction(2)
+        assert plan.reservation is not None
+        controller._acquire_logical_resident_pin_for_test(1)
+        controller._rollback_slot_transaction(plan.reservation)
+        assert (
+            controller._slots[0].state.name,
+            controller._slots[0].expert_id,
+            controller._slots[0].pins,
+            controller._slots[0].last_used,
+        ) == ("RESIDENT", 1, 1, 4)
+        fallback = controller._plan_slot_transaction(2)
+        assert fallback.status is _WNA16SlotPlanStatus.FALLBACK
+        assert fallback.slot is None
+    finally:
+        registration.close()
+
+
+def test_cpu_slot_planner_close_invalidates_outstanding_reservation():
+    controller = PrivateWNA16ResidencyController(layer_id=3, slot_count=1)
+    registration = register_private_wna16_provider_factory(controller)
+    _capture_canonical_cpu_bank(controller, canonical_cpu_bank_layer())
+    plan = controller._plan_slot_transaction(2)
+    assert plan.reservation is not None
+    registration.close()
+
+    assert controller._canonical_cpu_bank is None
+    assert controller._slots == []
+    assert controller._reservations == {}
+    with pytest.raises(Phase4UnsupportedError) as error:
+        controller._rollback_slot_transaction(plan.reservation)
+    assert error.value.category is Phase4FailureCategory.STALE_LEASE
+    with pytest.raises(Phase4UnsupportedError, match="unavailable"):
+        controller._plan_slot_transaction(2)
 
 
 def test_default_off_is_explicit_and_fail_closed():
