@@ -3,6 +3,9 @@
 
 from __future__ import annotations
 
+import ast
+import inspect
+import textwrap
 from collections.abc import Callable
 from dataclasses import FrozenInstanceError, replace
 from threading import Event, Thread
@@ -22,6 +25,7 @@ from vllm.model_executor.layers.fused_moe.expert_residency import (
     WNA16ExpertBundle,
     WNA16GenerationView,
     WNA16UseLease,
+    _bind_controller_wna16_cuda_map_authority,
     _bind_controller_wna16_slot_storage,
     _new_controller_wna16_stable_slot_capability,
     _private_wna16_dispatch_operands,
@@ -110,6 +114,36 @@ def private_view() -> WNA16GenerationView:
     return _bind_controller_wna16_slot_storage(
         view, _new_controller_wna16_stable_slot_capability()
     )
+
+
+def cuda_private_view() -> tuple[WNA16GenerationView, object]:
+    bundle = WNA16ExpertBundle(
+        schema_version=1,
+        backend="triton",
+        layer_id=3,
+        global_num_experts=4,
+        slot_count=2,
+        generation=9,
+        quant_type="W4A16",
+        num_bits=4,
+        symmetric=True,
+        group_size=32,
+        act_order=False,
+        w13=torch.zeros((2, 64, 16), device="cuda", dtype=torch.uint8),
+        w2=torch.zeros((2, 32, 16), device="cuda", dtype=torch.uint8),
+        w13_scale=torch.ones((2, 64, 1), device="cuda"),
+        w2_scale=torch.ones((2, 32, 1), device="cuda"),
+    )
+    lease = WNA16UseLease(layer_id=3, generation=9, bundle=bundle, token=1)
+    view = WNA16GenerationView(
+        bundle,
+        torch.tensor([0, -1, 1, -1], device="cuda", dtype=torch.int32),
+        9,
+        lease,
+    )
+    capability = _new_controller_wna16_stable_slot_capability()
+    view = _bind_controller_wna16_slot_storage(view, capability)
+    return _bind_controller_wna16_cuda_map_authority(view, capability), capability
 
 
 def canonical_cpu_bank_layer(*, asymmetric: bool = False):
@@ -1530,9 +1564,9 @@ def test_wna16_private_dispatch_cuda_forwarding_seam():
         map_generation=9,
         use_lease=lease,
     )
-    view = _bind_controller_wna16_slot_storage(
-        view, _new_controller_wna16_stable_slot_capability()
-    )
+    capability = _new_controller_wna16_stable_slot_capability()
+    view = _bind_controller_wna16_slot_storage(view, capability)
+    view = _bind_controller_wna16_cuda_map_authority(view, capability)
     operands = _private_wna16_dispatch_operands(view)
     layer = SimpleNamespace(
         use_ep=False,
@@ -1545,16 +1579,21 @@ def test_wna16_private_dispatch_cuda_forwarding_seam():
     topk_ids = torch.tensor([[2, 0]], device="cuda", dtype=torch.int32)
     ids_before, weights_before = topk_ids.clone(), topk_weights.clone()
 
-    CompressedTensorsWNA16MoEMethod.apply(
-        method,
-        layer=layer,
-        x=x,
-        topk_weights=topk_weights,
-        topk_ids=topk_ids,
-        shared_experts=None,
-        shared_experts_input=None,
-        generation_view=view,
-    )
+    with (
+        patch.object(torch.Tensor, "tolist", side_effect=AssertionError),
+        patch.object(torch.Tensor, "cpu", side_effect=AssertionError),
+        patch.object(torch.Tensor, "item", side_effect=AssertionError),
+    ):
+        CompressedTensorsWNA16MoEMethod.apply(
+            method,
+            layer=layer,
+            x=x,
+            topk_weights=topk_weights,
+            topk_ids=topk_ids,
+            shared_experts=None,
+            shared_experts_input=None,
+            generation_view=view,
+        )
 
     kernel.apply_private_wna16.assert_called_once()
     call = kernel.apply_private_wna16.call_args
@@ -1578,6 +1617,61 @@ def test_wna16_private_dispatch_cuda_forwarding_seam():
     assert torch.equal(topk_ids, ids_before)
     assert torch.equal(topk_weights, weights_before)
     kernel.apply.assert_not_called()
+
+
+def test_cuda_map_authority_branch_has_no_map_content_extraction_ast():
+    """CUDA map authority is narrower than router validation or host sync."""
+    source = textwrap.dedent(inspect.getsource(validate_wna16_generation_view))
+    tree = ast.parse(source)
+    cuda_branch = next(
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.If)
+        and isinstance(node.test, ast.Attribute)
+        and node.test.attr == "is_cuda"
+    )
+    extraction_calls = [
+        node.func.attr
+        for node in ast.walk(ast.Module(body=cuda_branch.body, type_ignores=[]))
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr in {"tolist", "cpu", "item"}
+    ]
+
+    assert extraction_calls == []
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")
+@pytest.mark.parametrize(
+    "field",
+    (
+        "layer_id",
+        "generation",
+        "map_generation",
+        "lease_generation",
+        "lease_token",
+        "global_num_experts",
+        "slot_count",
+        "device",
+    ),
+)
+def test_cuda_map_authority_rejects_revocation_and_metadata_substitution(field):
+    view, capability = cuda_private_view()
+    storage = object.__getattribute__(view, "_stable_slot_storage")
+    authority = storage._cuda_map_authority
+    assert authority is not None
+    value = torch.device("cpu") if field == "device" else getattr(authority, field) + 1
+    object.__setattr__(authority, field, value)
+
+    with pytest.raises(Phase4UnsupportedError) as error:
+        validate_wna16_generation_view(view)
+    assert error.value.category is Phase4FailureCategory.STALE_LEASE
+
+    view, capability = cuda_private_view()
+    capability.revoke()  # type: ignore[attr-defined]
+    with pytest.raises(Phase4UnsupportedError) as error:
+        validate_wna16_generation_view(view)
+    assert error.value.category is Phase4FailureCategory.STALE_LEASE
 
 
 def test_selected_private_layer_fails_closed_without_controller_factory():
@@ -3094,6 +3188,53 @@ def test_private_cuda_h2d_cpu_control_map_builds_fresh_candidate_and_rolls_back(
         assert controller._slots[0].state.name == "ABSENT"
     finally:
         controller.close()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")
+def test_prepared_cuda_h2d_transaction_rejects_forgery_and_replay():
+    """CUDA preflight only: prepared H2D reservations are exact and one-shot."""
+    controller = _staging_controller()
+    try:
+        transaction = controller._prepare_controller_private_cuda_h2d_transaction(
+            expert_id=0, staged_slot=staged_cuda_slot(controller)
+        )
+        forged = replace(transaction)
+        with pytest.raises(Phase4UnsupportedError) as error:
+            controller._rollback_prepared_controller_private_cuda_h2d_transaction(
+                forged
+            )
+        assert error.value.category is Phase4FailureCategory.STALE_LEASE
+        controller._rollback_prepared_controller_private_cuda_h2d_transaction(
+            transaction
+        )
+        with pytest.raises(Phase4UnsupportedError) as error:
+            controller._rollback_prepared_controller_private_cuda_h2d_transaction(
+                transaction
+            )
+        assert error.value.category is Phase4FailureCategory.STALE_LEASE
+        assert not controller._reservations
+        assert not controller._prepared_cuda_h2d_transactions
+    finally:
+        controller.close()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")
+def test_close_invalidates_prepared_cuda_h2d_transaction_without_reservation():
+    """Close clears unpublished ownership; its prepared rollback is stale."""
+    controller = _staging_controller()
+    transaction = controller._prepare_controller_private_cuda_h2d_transaction(
+        expert_id=0, staged_slot=staged_cuda_slot(controller)
+    )
+
+    controller.close()
+
+    assert not controller._reservations
+    assert not controller._prepared_cuda_h2d_transactions
+    with pytest.raises(Phase4UnsupportedError) as error:
+        controller._rollback_prepared_controller_private_cuda_h2d_transaction(
+            transaction
+        )
+    assert error.value.category is Phase4FailureCategory.STALE_LEASE
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")

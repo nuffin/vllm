@@ -16,7 +16,7 @@ from __future__ import annotations
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from enum import Enum, auto
-from typing import ClassVar
+from typing import ClassVar, cast
 from weakref import ReferenceType, ref
 
 import torch
@@ -467,10 +467,12 @@ class ExpertResidencyTable:
                 assert entry.generation == entry.bundle.generation
             elif entry.state is SlotState.LOADING:
                 assert entry.key is not None
-                reservation = self._loading.get(entry.key)
-                assert reservation is not None
-                assert reservation.slot == index
-                assert not reservation.staged_replacement
+                loading_reservation: ReservationLease | None = self._loading.get(
+                    entry.key
+                )
+                assert loading_reservation is not None
+                assert loading_reservation.slot == index
+                assert not loading_reservation.staged_replacement
                 assert entry.key not in self._published
                 assert entry.bundle is None
                 assert entry.generation is None
@@ -483,7 +485,7 @@ class ExpertResidencyTable:
                 assert entry.generation is None
                 assert entry.pins == 0
             else:
-                assert False, f"unexpected quiescent slot state: {entry.state}"
+                raise AssertionError(f"unexpected quiescent slot state: {entry.state}")
 
 
 class Phase4FailureCategory(Enum):
@@ -513,7 +515,7 @@ class Phase4Capability:
     """Explicit result of checking the narrow Phase-4 support matrix."""
 
     supported: bool
-    category: Phase4FailureCategory
+    category: Phase4FailureCategory | None
     reason: str
 
 
@@ -668,7 +670,9 @@ class Phase4GpuResidencyAdapter:
         del topk_ids, topk_weights, transient_expert_map
         self.unsupported_requests += 1
         capability = self.capability()
-        raise Phase4UnsupportedError(capability.category, capability.reason)
+        raise Phase4UnsupportedError(
+            cast(Phase4FailureCategory, capability.category), capability.reason
+        )
 
     def validate_generation_view(
         self,
@@ -697,7 +701,9 @@ class Phase4GpuResidencyAdapter:
         capability = self.capability()
         if not capability.supported:
             self.unsupported_requests += 1
-            raise Phase4UnsupportedError(capability.category, capability.reason)
+            raise Phase4UnsupportedError(
+                cast(Phase4FailureCategory, capability.category), capability.reason
+            )
 
 
 def _snapshot_tensor(tensor: torch.Tensor) -> torch.Tensor:
@@ -738,6 +744,33 @@ def _new_controller_wna16_stable_slot_capability() -> _WNA16StableSlotCapability
 
 
 @dataclass(frozen=True, slots=True)
+class _WNA16CudaMapAuthority:
+    """Opaque controller publication record for one private CUDA slot map.
+
+    This records only identity and scalar metadata.  It intentionally contains
+    no host-readable copy of the CUDA map. CUDA authority validation guarantees
+    no CUDA-map content extraction here; router validation may still reduce
+    CUDA tensors through ``bool(...any())``.
+    """
+
+    source_map: torch.Tensor
+    source_view: ReferenceType[WNA16GenerationView]
+    source_bundle: WNA16ExpertBundle
+    source_lease: WNA16UseLease
+    capability: _WNA16StableSlotCapability = field(repr=False, compare=False)
+    capability_epoch: int = field(repr=False, compare=False)
+    capability_nonce: object = field(repr=False, compare=False)
+    layer_id: int = 0
+    generation: int = 0
+    map_generation: int = 0
+    lease_generation: int = 0
+    lease_token: int = 0
+    global_num_experts: int = 0
+    slot_count: int = 0
+    device: torch.device = field(default_factory=lambda: torch.device("cpu"))
+
+
+@dataclass(frozen=True, slots=True)
 class _WNA16StableSlotStorage:
     """Controller-issued raw operands and their immutable dispatch fingerprint."""
 
@@ -759,6 +792,9 @@ class _WNA16StableSlotStorage:
     _capability: _WNA16StableSlotCapability = field(repr=False, compare=False)
     _capability_epoch: int = field(repr=False, compare=False)
     _capability_nonce: object = field(repr=False, compare=False)
+    _cuda_map_authority: _WNA16CudaMapAuthority | None = field(
+        default=None, repr=False, compare=False
+    )
 
     def revoke(self) -> None:
         """Invalidate this controller capability; subsequent dispatch fails closed."""
@@ -813,10 +849,7 @@ class WNA16ExpertBundle:
 
     def __getattribute__(self, name: str) -> object:
         value = object.__getattribute__(self, name)
-        if (
-            name in WNA16ExpertBundle._TENSOR_FIELDS
-            and isinstance(value, torch.Tensor)
-        ):
+        if name in WNA16ExpertBundle._TENSOR_FIELDS and isinstance(value, torch.Tensor):
             return _snapshot_tensor(value)
         return value
 
@@ -863,9 +896,7 @@ class WNA16GenerationView(_WeakrefableWNA16GenerationView):
 
     def __post_init__(self) -> None:
         if isinstance(self.slot_map, torch.Tensor):
-            object.__setattr__(
-                self, "slot_map", _snapshot_tensor(self.slot_map)
-            )
+            object.__setattr__(self, "slot_map", _snapshot_tensor(self.slot_map))
 
 
 @dataclass(frozen=True, slots=True)
@@ -938,6 +969,81 @@ def _bind_controller_wna16_slot_storage(
     return view
 
 
+def _bind_controller_wna16_cuda_map_authority(
+    view: WNA16GenerationView,
+    capability: _WNA16StableSlotCapability,
+) -> WNA16GenerationView:
+    """Publish controller authority for an already-private CUDA map.
+
+    This is deliberately an uncalled future-completion seam: it neither copies
+    map contents to the host nor publishes H2D state. A future controller may
+    call it only after proving its own transfer completion and exclusive map
+    ownership.
+    """
+    operands = _private_wna16_dispatch_operands(view)
+    storage = object.__getattribute__(view, "_stable_slot_storage")
+    if (
+        not isinstance(capability, _WNA16StableSlotCapability)
+        or capability is not storage._capability
+        or not capability._active
+        or storage._cuda_map_authority is not None
+        or not operands.slot_map.is_cuda
+    ):
+        raise _stale_wna16_lease("CUDA slot-map authority is stale or unavailable")
+    bundle = storage.source_bundle
+    lease = storage.source_lease
+    authority = _WNA16CudaMapAuthority(
+        source_map=operands.slot_map,
+        source_view=storage.source_view,
+        source_bundle=bundle,
+        source_lease=lease,
+        capability=capability,
+        capability_epoch=capability._epoch,
+        capability_nonce=capability._nonce,
+        layer_id=bundle.layer_id,
+        generation=bundle.generation,
+        map_generation=storage.source_map_generation,
+        lease_generation=lease.generation,
+        lease_token=lease.token,
+        global_num_experts=bundle.global_num_experts,
+        slot_count=bundle.slot_count,
+        device=operands.slot_map.device,
+    )
+    object.__setattr__(storage, "_cuda_map_authority", authority)
+    return view
+
+
+def _require_live_wna16_cuda_map_authority(
+    view: WNA16GenerationView, operands: _WNA16PrivateDispatchOperands
+) -> None:
+    """Validate CUDA-map provenance without extracting CUDA-map contents."""
+    storage = object.__getattribute__(view, "_stable_slot_storage")
+    authority = storage._cuda_map_authority
+    if not isinstance(authority, _WNA16CudaMapAuthority):
+        raise _stale_wna16_lease("CUDA slot-map authority is unavailable")
+    bundle = storage.source_bundle
+    lease = storage.source_lease
+    if (
+        authority.source_map is not operands.slot_map
+        or authority.source_view() is not view
+        or authority.source_bundle is not bundle
+        or authority.source_lease is not lease
+        or authority.capability is not storage._capability
+        or not authority.capability._active
+        or authority.capability_epoch != authority.capability._epoch
+        or authority.capability_nonce is not authority.capability._nonce
+        or authority.layer_id != bundle.layer_id
+        or authority.generation != bundle.generation
+        or authority.map_generation != storage.source_map_generation
+        or authority.lease_generation != lease.generation
+        or authority.lease_token != lease.token
+        or authority.global_num_experts != bundle.global_num_experts
+        or authority.slot_count != bundle.slot_count
+        or authority.device != operands.slot_map.device
+    ):
+        raise _stale_wna16_lease("CUDA slot-map authority is stale or substituted")
+
+
 def _private_wna16_dispatch_operands(
     view: WNA16GenerationView,
 ) -> _WNA16PrivateDispatchOperands:
@@ -973,8 +1079,13 @@ def _private_wna16_dispatch_operands(
     ):
         raise _stale_wna16_lease("stable WNA16 scalar fingerprint is stale")
     operands = _WNA16PrivateDispatchOperands(
-        storage.w13, storage.w2, storage.w13_scale, storage.w2_scale,
-        storage.w13_zero, storage.w2_zero, storage.slot_map,
+        storage.w13,
+        storage.w2,
+        storage.w13_scale,
+        storage.w2_scale,
+        storage.w13_zero,
+        storage.w2_zero,
+        storage.slot_map,
     )
     if (
         object.__getattribute__(bundle, "w13") is not operands.w13
@@ -1103,8 +1214,9 @@ def validate_wna16_generation_view(
             Phase4FailureCategory.VALIDATION,
             "WNA16 scales must be float32",
         )
-    if any(tensor.ndim != 3 or tensor.shape[0] != bundle.slot_count
-           for tensor in tensors):
+    if any(
+        tensor.ndim != 3 or tensor.shape[0] != bundle.slot_count for tensor in tensors
+    ):
         raise Phase4UnsupportedError(
             Phase4FailureCategory.VALIDATION,
             "WNA16 tensors must have rank 3 and leading slot_count",
@@ -1142,9 +1254,10 @@ def validate_wna16_generation_view(
         (bundle.slot_count, w13_rows, w13_input // bundle.group_size),
         (bundle.slot_count, w2_rows, w2_input // bundle.group_size),
     )
-    if tuple(scales[0].shape) != expected_scale_shapes[0] or tuple(
-        scales[1].shape
-    ) != expected_scale_shapes[1]:
+    if (
+        tuple(scales[0].shape) != expected_scale_shapes[0]
+        or tuple(scales[1].shape) != expected_scale_shapes[1]
+    ):
         raise Phase4UnsupportedError(
             Phase4FailureCategory.VALIDATION,
             "WNA16 scale shapes do not match packed weight dimensions",
@@ -1162,15 +1275,13 @@ def validate_wna16_generation_view(
     ):
         raise Phase4UnsupportedError(
             Phase4FailureCategory.VALIDATION,
-            "zero-point tensors must be contiguous uint8 tensors on "
-            "the bundle device",
+            "zero-point tensors must be contiguous uint8 tensors on the bundle device",
         )
     if (
         bundle.symmetric
         and (operands.w13_zero is not None or operands.w2_zero is not None)
     ) or (
-        not bundle.symmetric
-        and (operands.w13_zero is None or operands.w2_zero is None)
+        not bundle.symmetric and (operands.w13_zero is None or operands.w2_zero is None)
     ):
         raise Phase4UnsupportedError(
             Phase4FailureCategory.VALIDATION,
@@ -1186,9 +1297,10 @@ def validate_wna16_generation_view(
             if bundle.num_bits == 4
             else (bundle.slot_count, w2_rows, w2_input // bundle.group_size),
         )
-        if tuple(operands.w13_zero.shape) != expected_zero_shapes[0] or tuple(
-            operands.w2_zero.shape
-        ) != expected_zero_shapes[1]:
+        if (
+            tuple(operands.w13_zero.shape) != expected_zero_shapes[0]
+            or tuple(operands.w2_zero.shape) != expected_zero_shapes[1]
+        ):
             raise Phase4UnsupportedError(
                 Phase4FailureCategory.VALIDATION,
                 "zero-point tensor shapes do not match Triton layout",
@@ -1210,16 +1322,20 @@ def validate_wna16_generation_view(
             Phase4FailureCategory.VALIDATION,
             "slot_map.device must match bundle tensor device",
         )
-    values = slot_map.detach().cpu().tolist()
-    resident = [value for value in values if value != -1]
-    if (
-        any(value < -1 or value >= bundle.slot_count for value in resident)
-        or len(resident) != len(set(resident))
-    ):
-        raise Phase4UnsupportedError(
-            Phase4FailureCategory.VALIDATION,
-            "slot_map entries must be -1 or unique in-range slots",
-        )
+    if slot_map.is_cuda:
+        # CUDA-map contents are deliberately opaque at this boundary. Only an
+        # exact controller publication record can replace CPU semantic checking.
+        _require_live_wna16_cuda_map_authority(view, operands)
+    else:
+        values = slot_map.detach().cpu().tolist()
+        resident = [value for value in values if value != -1]
+        if any(value < -1 or value >= bundle.slot_count for value in resident) or len(
+            resident
+        ) != len(set(resident)):
+            raise Phase4UnsupportedError(
+                Phase4FailureCategory.VALIDATION,
+                "slot_map entries must be -1 or unique in-range slots",
+            )
     lease = view.use_lease
     if (
         not isinstance(lease, WNA16UseLease)
@@ -1245,7 +1361,11 @@ def validate_private_wna16_dispatch_inputs(
     global_num_experts: int,
     layer_id: int,
 ) -> None:
-    """Validate complete private-dispatch inputs before a Triton launch."""
+    """Validate complete private-dispatch inputs before a Triton launch.
+
+    CUDA map authority prevents CUDA-map content extraction. Router-domain and
+    residency reductions below use ``bool(...any())`` and may synchronize.
+    """
     validate_wna16_generation_view(view, layer_id=layer_id)
     bundle = view.bundle
     operands = _private_wna16_dispatch_operands(view)
@@ -1255,13 +1375,16 @@ def validate_private_wna16_dispatch_inputs(
             "private WNA16 global expert count mismatch",
         )
     tensors = (
-        operands.w13, operands.w2, operands.w13_scale, operands.w2_scale,
+        operands.w13,
+        operands.w2,
+        operands.w13_scale,
+        operands.w2_scale,
         operands.slot_map,
-        topk_ids, topk_weights,
+        topk_ids,
+        topk_weights,
     )
-    if (
-        hidden_states.device.type != "cuda"
-        or any(tensor.device != hidden_states.device for tensor in tensors)
+    if hidden_states.device.type != "cuda" or any(
+        tensor.device != hidden_states.device for tensor in tensors
     ):
         raise Phase4UnsupportedError(
             Phase4FailureCategory.VALIDATION,

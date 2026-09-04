@@ -651,6 +651,9 @@ class PrivateWNA16ResidencyController:
         self._slots: list[_WNA16LogicalSlot] = []
         self._slot_clock = 0
         self._reservations: dict[object, _WNA16SlotReservation] = {}
+        self._prepared_cuda_h2d_transactions: dict[
+            object, _WNA16PreparedCudaH2DTransaction
+        ] = {}
         self._retained_cpu_source_slots: dict[object, _WNA16CpuSourceSlotRetention] = {}
         self._cpu_source_slot_retention_queries: set[object] = set()
         self._closed = False
@@ -975,9 +978,20 @@ class PrivateWNA16ResidencyController:
                 raise _lifecycle_error("private WNA16 slot reservation is missing")
             candidate = self._build_cpu_candidate_slot_map(reservation)
             self._validate_cuda_h2d_destination(reservation, staged_slot)
-            return _WNA16PreparedCudaH2DTransaction(
+            transaction = _WNA16PreparedCudaH2DTransaction(
                 self, reservation, candidate, staged_slot, object()
             )
+            with self._lifecycle_lock:
+                if (
+                    self._closed
+                    or self._reservations.get(reservation.token) is not reservation
+                    or transaction.token in self._prepared_cuda_h2d_transactions
+                ):
+                    raise _lifecycle_error(
+                        "private WNA16 CUDA H2D transaction is stale", stale=True
+                    )
+                self._prepared_cuda_h2d_transactions[transaction.token] = transaction
+            return transaction
         except BaseException:
             if reservation is not None:
                 with suppress(BaseException):
@@ -988,13 +1002,20 @@ class PrivateWNA16ResidencyController:
         self, transaction: _WNA16PreparedCudaH2DTransaction
     ) -> None:
         """Release a pre-enqueue ABI reservation with no CUDA ownership."""
-        if (
-            not isinstance(transaction, _WNA16PreparedCudaH2DTransaction)
-            or transaction.controller is not self
-        ):
-            raise _lifecycle_error(
-                "private WNA16 CUDA H2D transaction is stale", stale=True
-            )
+        with self._lifecycle_lock:
+            if (
+                not isinstance(transaction, _WNA16PreparedCudaH2DTransaction)
+                or transaction.controller is not self
+                or self._closed
+                or self._prepared_cuda_h2d_transactions.get(transaction.token)
+                is not transaction
+                or self._reservations.get(transaction.reservation.token)
+                is not transaction.reservation
+            ):
+                raise _lifecycle_error(
+                    "private WNA16 CUDA H2D transaction is stale", stale=True
+                )
+            del self._prepared_cuda_h2d_transactions[transaction.token]
         self._rollback_slot_transaction(transaction.reservation)
 
     def _build_cpu_candidate_slot_map(
@@ -1331,6 +1352,7 @@ class PrivateWNA16ResidencyController:
             self._bound_routed_experts = None
             self._slots.clear()
             self._reservations.clear()
+            self._prepared_cuda_h2d_transactions.clear()
             self._cpu_source_slot_retention_queries.clear()
 
     def _request_generation_view(
