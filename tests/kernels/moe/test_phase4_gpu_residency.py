@@ -4,7 +4,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
-from dataclasses import replace
+from dataclasses import FrozenInstanceError, replace
 from threading import Event, Thread
 from types import SimpleNamespace
 from typing import cast
@@ -584,6 +584,318 @@ def test_cpu_slot_planner_close_invalidates_outstanding_reservation():
     assert error.value.category is Phase4FailureCategory.STALE_LEASE
     with pytest.raises(Phase4UnsupportedError, match="unavailable"):
         controller._plan_slot_transaction(2)
+
+
+def test_cpu_source_slot_retention_blocks_reuse_until_exact_true_close_retry():
+    """CPU-only ownership remains held; this is not a CUDA completion test."""
+    controller = PrivateWNA16ResidencyController(layer_id=3, slot_count=1)
+    registration = register_private_wna16_provider_factory(controller)
+
+    class Completion:
+        result: object = False
+
+        def query(self):
+            return self.result
+
+    completion = Completion()
+    try:
+        _capture_canonical_cpu_bank(controller, canonical_cpu_bank_layer())
+        source = controller._canonical_cpu_bank
+        plan = controller._plan_slot_transaction(2)
+        assert source is not None
+        assert plan.reservation is not None
+        retention = controller._retain_cpu_source_slot_until_completion(
+            plan.reservation, completion
+        )
+
+        assert retention.source is source
+        assert retention.reservation is plan.reservation
+        controller._finalize_completed_cpu_source_slot_retentions()
+        assert controller._canonical_cpu_bank is source
+        assert controller._reservations[plan.reservation.token] is plan.reservation
+        assert controller._retained_cpu_source_slots[retention.token] is retention
+        assert (
+            controller._plan_slot_transaction(1).status is _WNA16SlotPlanStatus.FALLBACK
+        )
+
+        with pytest.raises(Phase4UnsupportedError) as error:
+            registration.close()
+        assert error.value.category is Phase4FailureCategory.DRAIN_INCOMPLETE
+        assert controller._canonical_cpu_bank is source
+        assert controller._reservations[plan.reservation.token] is plan.reservation
+
+        completion.result = True
+        registration.close()
+        assert controller._canonical_cpu_bank is None
+        assert controller._slots == []
+        assert controller._reservations == {}
+        assert controller._retained_cpu_source_slots == {}
+    finally:
+        completion.result = True
+        registration.close()
+
+
+@pytest.mark.parametrize("result", [1, 0, "complete", None])
+def test_cpu_source_slot_retention_rejects_non_bool_completion_without_freeing(result):
+    controller = PrivateWNA16ResidencyController(layer_id=3, slot_count=1)
+    registration = register_private_wna16_provider_factory(controller)
+
+    class Completion:
+        value: object = result
+
+        def query(self):
+            return self.value
+
+    completion = Completion()
+    try:
+        _capture_canonical_cpu_bank(controller, canonical_cpu_bank_layer())
+        source = controller._canonical_cpu_bank
+        plan = controller._plan_slot_transaction(2)
+        assert source is not None
+        assert plan.reservation is not None
+        retention = controller._retain_cpu_source_slot_until_completion(
+            plan.reservation, completion
+        )
+
+        with pytest.raises(Phase4UnsupportedError) as error:
+            controller._finalize_completed_cpu_source_slot_retentions()
+        assert error.value.category is Phase4FailureCategory.EVENT_QUERY
+        assert controller._canonical_cpu_bank is source
+        assert controller._reservations[plan.reservation.token] is plan.reservation
+        assert controller._retained_cpu_source_slots[retention.token] is retention
+        assert (
+            controller._plan_slot_transaction(1).status is _WNA16SlotPlanStatus.FALLBACK
+        )
+
+        completion.value = True
+        controller._finalize_completed_cpu_source_slot_retentions()
+        assert controller._retained_cpu_source_slots == {}
+        assert controller._reservations == {}
+    finally:
+        completion.value = True
+        registration.close()
+
+
+def test_cpu_source_slot_retention_query_is_outside_lifecycle_lock():
+    controller = PrivateWNA16ResidencyController(layer_id=3, slot_count=1)
+    registration = register_private_wna16_provider_factory(controller)
+    try:
+        _capture_canonical_cpu_bank(controller, canonical_cpu_bank_layer())
+        plan = controller._plan_slot_transaction(2)
+        assert plan.reservation is not None
+
+        class Completion:
+            def query(self) -> bool:
+                acquired: list[bool] = []
+
+                def acquire_lifecycle_lock() -> None:
+                    locked = controller._lifecycle_lock.acquire(blocking=False)
+                    acquired.append(locked)
+                    if locked:
+                        controller._lifecycle_lock.release()
+
+                thread = Thread(target=acquire_lifecycle_lock)
+                thread.start()
+                thread.join(timeout=5)
+                assert not thread.is_alive()
+                assert acquired == [True]
+                return True
+
+        retention = controller._retain_cpu_source_slot_until_completion(
+            plan.reservation, Completion()
+        )
+        controller._finalize_completed_cpu_source_slot_retentions()
+        assert retention.token not in controller._retained_cpu_source_slots
+        assert plan.reservation.token not in controller._reservations
+    finally:
+        registration.close()
+
+
+def test_cpu_source_slot_retention_query_error_retains_until_close_retry():
+    controller = PrivateWNA16ResidencyController(layer_id=3, slot_count=1)
+    registration = register_private_wna16_provider_factory(controller)
+
+    class Completion:
+        complete = False
+
+        def query(self) -> bool:
+            if not self.complete:
+                raise RuntimeError("query failed")
+            return True
+
+    completion = Completion()
+    try:
+        _capture_canonical_cpu_bank(controller, canonical_cpu_bank_layer())
+        source = controller._canonical_cpu_bank
+        plan = controller._plan_slot_transaction(2)
+        assert source is not None
+        assert plan.reservation is not None
+        retention = controller._retain_cpu_source_slot_until_completion(
+            plan.reservation, completion
+        )
+
+        with pytest.raises(Phase4UnsupportedError) as error:
+            registration.close()
+        assert error.value.category is Phase4FailureCategory.EVENT_QUERY
+        assert isinstance(error.value.__cause__, RuntimeError)
+        assert controller._canonical_cpu_bank is source
+        assert controller._reservations[plan.reservation.token] is plan.reservation
+        assert controller._retained_cpu_source_slots[retention.token] is retention
+
+        completion.complete = True
+        registration.close()
+        assert controller._canonical_cpu_bank is None
+        assert controller._retained_cpu_source_slots == {}
+    finally:
+        completion.complete = True
+        registration.close()
+
+
+def test_cpu_source_slot_retention_requires_exact_reservation_identity():
+    controller = PrivateWNA16ResidencyController(layer_id=3, slot_count=1)
+    registration = register_private_wna16_provider_factory(controller)
+    retention = None
+    completion = SimpleNamespace(complete=False)
+    completion.query = lambda: completion.complete
+    try:
+        _capture_canonical_cpu_bank(controller, canonical_cpu_bank_layer())
+        plan = controller._plan_slot_transaction(2)
+        assert plan.reservation is not None
+        forged = replace(plan.reservation)
+        with pytest.raises(Phase4UnsupportedError) as error:
+            controller._retain_cpu_source_slot_until_completion(forged, object())
+        assert error.value.category is Phase4FailureCategory.STALE_LEASE
+        retention = controller._retain_cpu_source_slot_until_completion(
+            plan.reservation, completion
+        )
+        with pytest.raises(Phase4UnsupportedError) as error:
+            controller._retain_cpu_source_slot_until_completion(
+                plan.reservation, object()
+            )
+        assert error.value.category is Phase4FailureCategory.STALE_LEASE
+        assert controller._retained_cpu_source_slots[retention.token] is retention
+    finally:
+        completion.complete = True
+        registration.close()
+
+
+def test_cpu_source_slot_retention_binding_is_immutable_and_forged_cannot_free():
+    controller = PrivateWNA16ResidencyController(layer_id=3, slot_count=1)
+    registration = register_private_wna16_provider_factory(controller)
+
+    class Completion:
+        complete = False
+
+        def query(self) -> bool:
+            return self.complete
+
+    completion = Completion()
+    try:
+        _capture_canonical_cpu_bank(controller, canonical_cpu_bank_layer())
+        source = controller._canonical_cpu_bank
+        plan = controller._plan_slot_transaction(2)
+        assert source is not None
+        assert plan.reservation is not None
+        retention = controller._retain_cpu_source_slot_until_completion(
+            plan.reservation, completion
+        )
+        with pytest.raises(FrozenInstanceError):
+            retention.completion = SimpleNamespace(query=lambda: True)
+        forged = replace(retention)
+        controller._finalize_completed_cpu_source_slot_retention(forged)
+        assert controller._canonical_cpu_bank is source
+        assert controller._reservations[plan.reservation.token] is plan.reservation
+        assert controller._retained_cpu_source_slots[retention.token] is retention
+        assert controller._slots[plan.reservation.slot].state.name == "RESERVED_EMPTY"
+        completion.complete = True
+        controller._finalize_completed_cpu_source_slot_retentions()
+    finally:
+        completion.complete = True
+        registration.close()
+
+
+def test_cpu_source_slot_retention_rejects_rollback_until_completion():
+    controller = PrivateWNA16ResidencyController(layer_id=3, slot_count=1)
+    registration = register_private_wna16_provider_factory(controller)
+    completion = SimpleNamespace(complete=False)
+    completion.query = lambda: completion.complete
+    try:
+        _capture_canonical_cpu_bank(controller, canonical_cpu_bank_layer())
+        plan = controller._plan_slot_transaction(2)
+        assert plan.reservation is not None
+        retention = controller._retain_cpu_source_slot_until_completion(
+            plan.reservation, completion
+        )
+        with pytest.raises(Phase4UnsupportedError) as error:
+            controller._rollback_slot_transaction(plan.reservation)
+        assert error.value.category is Phase4FailureCategory.STALE_LEASE
+        assert controller._reservations[plan.reservation.token] is plan.reservation
+        assert controller._retained_cpu_source_slots[retention.token] is retention
+        assert (
+            controller._plan_slot_transaction(1).status is _WNA16SlotPlanStatus.FALLBACK
+        )
+        completion.complete = True
+        controller._finalize_completed_cpu_source_slot_retentions()
+    finally:
+        completion.complete = True
+        registration.close()
+
+
+def test_cpu_source_slot_retention_close_race_retries_after_inflight_query():
+    controller = PrivateWNA16ResidencyController(layer_id=3, slot_count=1)
+    registration = register_private_wna16_provider_factory(controller)
+    entered = Event()
+    allow_return = Event()
+    errors: list[BaseException] = []
+    thread: Thread | None = None
+
+    class Completion:
+        def query(self) -> bool:
+            entered.set()
+            assert allow_return.wait(timeout=5)
+            return True
+
+    try:
+        _capture_canonical_cpu_bank(controller, canonical_cpu_bank_layer())
+        source = controller._canonical_cpu_bank
+        plan = controller._plan_slot_transaction(2)
+        assert source is not None
+        assert plan.reservation is not None
+        retention = controller._retain_cpu_source_slot_until_completion(
+            plan.reservation, Completion()
+        )
+
+        def finalize() -> None:
+            try:
+                controller._finalize_completed_cpu_source_slot_retentions()
+            except BaseException as error:
+                errors.append(error)
+
+        thread = Thread(target=finalize)
+        thread.start()
+        assert entered.wait(timeout=5)
+        with pytest.raises(Phase4UnsupportedError) as error:
+            registration.close()
+        assert error.value.category is Phase4FailureCategory.DRAIN_INCOMPLETE
+        assert controller._canonical_cpu_bank is source
+        assert controller._reservations[plan.reservation.token] is plan.reservation
+        assert controller._retained_cpu_source_slots[retention.token] is retention
+        with pytest.raises(Phase4UnsupportedError, match="unavailable"):
+            controller._plan_slot_transaction(1)
+        allow_return.set()
+        thread.join(timeout=5)
+        assert not thread.is_alive()
+        assert errors == []
+        registration.close()
+        assert controller._canonical_cpu_bank is None
+        assert controller._slots == []
+        assert controller._reservations == {}
+        assert controller._retained_cpu_source_slots == {}
+    finally:
+        allow_return.set()
+        if thread is not None:
+            thread.join(timeout=5)
+        registration.close()
 
 
 def test_default_off_is_explicit_and_fail_closed():

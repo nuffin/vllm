@@ -120,6 +120,17 @@ class _WNA16SlotReservation:
 
 
 @dataclass(frozen=True, slots=True)
+class _WNA16CpuSourceSlotRetention:
+    """CPU-only future-transfer ownership held until a predicate proves release."""
+
+    controller: object
+    source: _CanonicalWNA16CpuBank
+    reservation: _WNA16SlotReservation
+    completion: object
+    token: object
+
+
+@dataclass(frozen=True, slots=True)
 class _WNA16SlotPlan:
     status: _WNA16SlotPlanStatus
     slot: int | None
@@ -606,6 +617,8 @@ class PrivateWNA16ResidencyController:
         self._slots: list[_WNA16LogicalSlot] = []
         self._slot_clock = 0
         self._reservations: dict[object, _WNA16SlotReservation] = {}
+        self._retained_cpu_source_slots: dict[object, _WNA16CpuSourceSlotRetention] = {}
+        self._cpu_source_slot_retention_queries: set[object] = set()
         self._closed = False
 
     def __call__(
@@ -782,6 +795,10 @@ class PrivateWNA16ResidencyController:
                 reservation.controller is not self
                 or self._closed
                 or self._reservations.get(reservation.token) is not reservation
+                or any(
+                    retention.reservation is reservation
+                    for retention in self._retained_cpu_source_slots.values()
+                )
             ):
                 raise _lifecycle_error(
                     "private WNA16 slot reservation is stale", stale=True
@@ -808,6 +825,110 @@ class PrivateWNA16ResidencyController:
                 pins=reservation.previous_slot.pins + max(late_pins, 0),
                 last_used=reservation.previous_slot.last_used,
             )
+
+    def _retain_cpu_source_slot_until_completion(
+        self, reservation: _WNA16SlotReservation, completion: object
+    ) -> _WNA16CpuSourceSlotRetention:
+        """Retain one exact CPU source and logical slot for a future handoff.
+
+        This models only controller-private ownership. It is not a CUDA event,
+        H2D operation, scheduler request completion, or device reuse fence.
+        """
+        with self._lifecycle_lock:
+            source = self._canonical_cpu_bank
+            if (
+                self._closed
+                or source is None
+                or reservation.controller is not self
+                or self._reservations.get(reservation.token) is not reservation
+                or any(
+                    retained.reservation is reservation
+                    for retained in self._retained_cpu_source_slots.values()
+                )
+            ):
+                raise _lifecycle_error(
+                    "private WNA16 CPU source-slot retention is stale", stale=True
+                )
+            retention = _WNA16CpuSourceSlotRetention(
+                self, source, reservation, completion, object()
+            )
+            self._retained_cpu_source_slots[retention.token] = retention
+            return retention
+
+    def _finalize_completed_cpu_source_slot_retentions(self) -> None:
+        """Poll CPU-only completion predicates without holding lifecycle ownership."""
+        with self._lifecycle_lock:
+            retentions = tuple(self._retained_cpu_source_slots.values())
+        first_error: Phase4UnsupportedError | None = None
+        for retention in retentions:
+            try:
+                self._finalize_completed_cpu_source_slot_retention(retention)
+            except Phase4UnsupportedError as error:
+                if first_error is None:
+                    first_error = error
+        if first_error is not None:
+            raise first_error
+
+    def _finalize_completed_cpu_source_slot_retention(
+        self, retention: _WNA16CpuSourceSlotRetention
+    ) -> None:
+        with self._lifecycle_lock:
+            if (
+                retention.token in self._cpu_source_slot_retention_queries
+                or not self._is_exact_cpu_source_slot_retention(retention)
+            ):
+                return
+            completion = retention.completion
+            self._cpu_source_slot_retention_queries.add(retention.token)
+        completed = False
+        try:
+            try:
+                query = getattr(completion, "query", None)
+                if not callable(query):
+                    raise TypeError("completion predicate has no callable query")
+                result = query()
+            except Exception as error:
+                raise _event_query_error("completion predicate query failed") from error
+            if type(result) is not bool:
+                raise _event_query_error(
+                    "completion predicate query did not return bool"
+                )
+            completed = result
+        finally:
+            with self._lifecycle_lock:
+                self._cpu_source_slot_retention_queries.discard(retention.token)
+                if completed and self._is_exact_cpu_source_slot_retention(retention):
+                    reservation = retention.reservation
+                    slot = self._slots[reservation.slot]
+                    self._reservations.pop(reservation.token)
+                    self._retained_cpu_source_slots.pop(retention.token)
+                    late_pins = slot.pins - reservation.previous_slot.pins
+                    self._slots[reservation.slot] = _WNA16LogicalSlot(
+                        state=reservation.previous_slot.state,
+                        expert_id=reservation.previous_slot.expert_id,
+                        pins=reservation.previous_slot.pins + max(late_pins, 0),
+                        last_used=reservation.previous_slot.last_used,
+                    )
+
+    def _is_exact_cpu_source_slot_retention(
+        self, retention: _WNA16CpuSourceSlotRetention
+    ) -> bool:
+        reservation = retention.reservation
+        if (
+            retention.controller is not self
+            or self._retained_cpu_source_slots.get(retention.token) is not retention
+            or retention.source is not self._canonical_cpu_bank
+            or reservation.controller is not self
+            or self._reservations.get(reservation.token) is not reservation
+            or reservation.slot >= len(self._slots)
+        ):
+            return False
+        expected_state = (
+            _WNA16SlotState.RESERVED_EMPTY
+            if reservation.previous_slot.state is _WNA16SlotState.ABSENT
+            else _WNA16SlotState.STAGED_REPLACEMENT
+        )
+        return self._slots[reservation.slot].state is expected_state
 
     def _seed_logical_resident_for_test(
         self, slot_index: int, expert_id: int, *, last_used: int = 0
@@ -860,10 +981,15 @@ class PrivateWNA16ResidencyController:
     def close(self) -> None:
         with self._lifecycle_lock:
             self._closed = True
+        self._finalize_completed_cpu_source_slot_retentions()
+        with self._lifecycle_lock:
+            if self._retained_cpu_source_slots:
+                raise _drain_incomplete_error()
             self._canonical_cpu_bank = None
             self._bound_routed_experts = None
             self._slots.clear()
             self._reservations.clear()
+            self._cpu_source_slot_retention_queries.clear()
 
     def _request_generation_view(
         self,
