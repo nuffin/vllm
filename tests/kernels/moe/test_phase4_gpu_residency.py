@@ -3190,6 +3190,292 @@ def test_private_cuda_h2d_cpu_control_map_builds_fresh_candidate_and_rolls_back(
         controller.close()
 
 
+def test_cpu_generation_transaction_is_atomic_immutable_and_unpublished():
+    """CPU contract only: no H2D, event, map publication, or view issuance."""
+    controller = _staging_controller()
+    try:
+        transaction = controller._prepare_controller_private_cpu_generation_transaction(
+            expert_ids=(0, 3, 0)
+        )
+        assert transaction.generation == 1
+        assert transaction.candidate_cpu_slot_map.tolist() == [0, -1, -1, 1]
+        assert len(transaction.reservations) == 2
+        assert transaction.operands.w13_weight_zero_point is None
+        assert transaction.operands.w2_weight_zero_point is None
+        assert transaction.source is controller._canonical_cpu_bank
+        candidate = transaction.candidate_cpu_slot_map
+        candidate[0] = -1
+        assert transaction.candidate_cpu_slot_map.tolist() == [0, -1, -1, 1]
+        assert not controller._retained_cpu_source_slots
+        with pytest.raises(Phase4UnsupportedError):
+            controller._request_generation_view(
+                topk_ids=torch.tensor([[0]]), topk_weights=torch.tensor([[1.0]])
+            )
+        controller._rollback_controller_private_cpu_generation_transaction(transaction)
+        assert not controller._reservations
+        assert not controller._prepared_cpu_generation_transactions
+        assert all(slot.state.name == "ABSENT" for slot in controller._slots)
+    finally:
+        controller.close()
+
+
+def test_cpu_generation_transaction_construction_failure_rolls_back_all_slots():
+    """A failed immutable candidate clone cannot leak any reservation or capacity."""
+
+    class CandidateCloneFailure(BaseException):
+        pass
+
+    controller = _staging_controller()
+    try:
+        before = [controller._snapshot_slot(slot) for slot in controller._slots]
+        with (
+            patch(
+                "vllm.model_executor.layers.fused_moe.private_wna16_provider."
+                "torch.Tensor.clone",
+                side_effect=CandidateCloneFailure("candidate clone failed"),
+            ),
+            pytest.raises(CandidateCloneFailure, match="candidate clone failed"),
+        ):
+            controller._prepare_controller_private_cpu_generation_transaction(
+                expert_ids=(0, 3)
+            )
+        assert [controller._snapshot_slot(slot) for slot in controller._slots] == before
+        assert not controller._reservations
+        assert not controller._prepared_cpu_generation_transactions
+        assert controller._next_cpu_generation == 0
+    finally:
+        controller.close()
+
+
+def test_cpu_generation_construction_rollback_failure_retains_retry_ownership():
+    """Construction keeps failed cleanup private until a later retry frees capacity."""
+
+    class CandidateCloneFailure(BaseException):
+        pass
+
+    controller = _staging_controller()
+    try:
+        original_rollback = controller._rollback_slot_transaction
+        failed_once = False
+
+        def fail_one_rollback(reservation):
+            nonlocal failed_once
+            if not failed_once:
+                failed_once = True
+                raise RuntimeError("construction cleanup failed")
+            original_rollback(reservation)
+
+        with (
+            patch(
+                "vllm.model_executor.layers.fused_moe.private_wna16_provider."
+                "torch.Tensor.clone",
+                side_effect=CandidateCloneFailure("candidate clone failed"),
+            ),
+            patch.object(
+                controller, "_rollback_slot_transaction", side_effect=fail_one_rollback
+            ),
+            pytest.raises(CandidateCloneFailure, match="candidate clone failed"),
+        ):
+            controller._prepare_controller_private_cpu_generation_transaction(
+                expert_ids=(0, 3)
+            )
+
+        assert len(controller._cpu_generation_construction_rollbacks) == 1
+        assert len(controller._reservations) == 1
+        retry = controller._prepare_controller_private_cpu_generation_transaction(
+            expert_ids=(1,)
+        )
+        assert not controller._cpu_generation_construction_rollbacks
+        assert len(controller._reservations) == 1
+        controller._rollback_controller_private_cpu_generation_transaction(retry)
+        assert not controller._reservations
+        assert all(slot.state.name == "ABSENT" for slot in controller._slots)
+    finally:
+        controller.close()
+
+
+def test_cpu_generation_transaction_successful_generations_are_monotonic():
+    controller = _staging_controller()
+    try:
+        first = controller._prepare_controller_private_cpu_generation_transaction(
+            expert_ids=(0,)
+        )
+        controller._rollback_controller_private_cpu_generation_transaction(first)
+        second = controller._prepare_controller_private_cpu_generation_transaction(
+            expert_ids=(1,)
+        )
+        assert (first.generation, second.generation) == (1, 2)
+        controller._rollback_controller_private_cpu_generation_transaction(second)
+    finally:
+        controller.close()
+
+
+def test_cpu_generation_transaction_rejects_forgery_replay_and_close():
+    controller = _staging_controller()
+    try:
+        transaction = controller._prepare_controller_private_cpu_generation_transaction(
+            expert_ids=(0,)
+        )
+        forged = replace(transaction)
+        before = [controller._snapshot_slot(slot) for slot in controller._slots]
+        with pytest.raises(Phase4UnsupportedError) as error:
+            controller._rollback_controller_private_cpu_generation_transaction(forged)
+        assert error.value.category is Phase4FailureCategory.STALE_LEASE
+        assert [controller._snapshot_slot(slot) for slot in controller._slots] == before
+        assert controller._prepared_cpu_generation_transactions
+
+        controller._rollback_controller_private_cpu_generation_transaction(transaction)
+        with pytest.raises(Phase4UnsupportedError) as error:
+            controller._rollback_controller_private_cpu_generation_transaction(
+                transaction
+            )
+        assert error.value.category is Phase4FailureCategory.STALE_LEASE
+        assert not controller._reservations
+        assert not controller._prepared_cpu_generation_transactions
+
+        transaction = controller._prepare_controller_private_cpu_generation_transaction(
+            expert_ids=(0,)
+        )
+        controller.close()
+        assert not controller._reservations
+        assert not controller._prepared_cpu_generation_transactions
+        with pytest.raises(Phase4UnsupportedError) as error:
+            controller._rollback_controller_private_cpu_generation_transaction(
+                transaction
+            )
+        assert error.value.category is Phase4FailureCategory.STALE_LEASE
+    finally:
+        if not controller._closed:
+            controller.close()
+
+
+def test_cpu_generation_transaction_capacity_failure_has_no_partial_reservation():
+    controller = _staging_controller()
+    try:
+        before = [controller._snapshot_slot(slot) for slot in controller._slots]
+        with pytest.raises(Phase4UnsupportedError) as error:
+            controller._prepare_controller_private_cpu_generation_transaction(
+                expert_ids=(0, 1, 2)
+            )
+        assert error.value.category is Phase4FailureCategory.UNSUPPORTED_DYNAMIC_MAP
+        assert [controller._snapshot_slot(slot) for slot in controller._slots] == before
+        assert not controller._reservations
+        assert not controller._prepared_cpu_generation_transactions
+    finally:
+        controller.close()
+
+
+def test_cpu_generation_transaction_retains_paired_asymmetric_zero_points():
+    controller = PrivateWNA16ResidencyController(layer_id=3, slot_count=1)
+    layer = canonical_cpu_bank_layer(asymmetric=True)
+    try:
+        controller(
+            PrivateWNA16ProviderBindingRequest(
+                layer_id=3, routed_experts=cast(RoutedExperts, layer)
+            )
+        )
+        controller.capture_post_conversion(
+            layer=cast(RoutedExperts, layer),
+            backend=WNA16MoEBackend.TRITON,
+            num_bits=4,
+            symmetric=False,
+            group_size=32,
+            act_order=False,
+        )
+        transaction = controller._prepare_controller_private_cpu_generation_transaction(
+            expert_ids=(0,)
+        )
+        assert transaction.operands.w13_weight_zero_point is not None
+        assert transaction.operands.w2_weight_zero_point is not None
+        controller._rollback_controller_private_cpu_generation_transaction(transaction)
+    finally:
+        controller.close()
+
+
+def test_cpu_generation_transaction_operands_are_defensive_snapshots():
+    """Operand mutations cannot alter the canonical bank or transaction state."""
+    controller = PrivateWNA16ResidencyController(layer_id=3, slot_count=1)
+    layer = canonical_cpu_bank_layer(asymmetric=True)
+    try:
+        controller(
+            PrivateWNA16ProviderBindingRequest(
+                layer_id=3, routed_experts=cast(RoutedExperts, layer)
+            )
+        )
+        controller.capture_post_conversion(
+            layer=cast(RoutedExperts, layer),
+            backend=WNA16MoEBackend.TRITON,
+            num_bits=4,
+            symmetric=False,
+            group_size=32,
+            act_order=False,
+        )
+        transaction = controller._prepare_controller_private_cpu_generation_transaction(
+            expert_ids=(0,)
+        )
+        bank = controller._canonical_cpu_bank
+        assert bank is not None
+        operands = transaction.operands
+        operand_names = (
+            "w13_weight_packed",
+            "w2_weight_packed",
+            "w13_weight_scale",
+            "w2_weight_scale",
+            "w13_weight_zero_point",
+            "w2_weight_zero_point",
+        )
+        assert all(getattr(operands, name) is not None for name in operand_names)
+        canonical = {name: getattr(bank, name).clone() for name in operand_names}
+        expected = {name: getattr(operands, name).clone() for name in operand_names}
+        for name in operand_names:
+            getattr(operands, name).zero_()
+        for name in operand_names:
+            assert torch.equal(getattr(bank, name), canonical[name])
+            assert torch.equal(getattr(transaction.operands, name), expected[name])
+        controller._rollback_controller_private_cpu_generation_transaction(transaction)
+    finally:
+        controller.close()
+
+
+def test_cpu_generation_transaction_rollback_failure_retains_retry_ownership():
+    """A later cleanup failure leaves ownership intact and is retryable."""
+    controller = _staging_controller()
+    try:
+        transaction = controller._prepare_controller_private_cpu_generation_transaction(
+            expert_ids=(0, 3)
+        )
+        original_rollback = controller._rollback_slot_transaction
+        failed_reservation = transaction.reservations[0]
+        failed_once = False
+
+        def fail_later_reservation(reservation):
+            nonlocal failed_once
+            if reservation is failed_reservation and not failed_once:
+                failed_once = True
+                raise RuntimeError("later cleanup failed")
+            original_rollback(reservation)
+
+        with (
+            patch.object(
+                controller,
+                "_rollback_slot_transaction",
+                side_effect=fail_later_reservation,
+            ),
+            pytest.raises(RuntimeError, match="later cleanup failed"),
+        ):
+            controller._rollback_controller_private_cpu_generation_transaction(
+                transaction
+            )
+        assert transaction.token in controller._prepared_cpu_generation_transactions
+        assert failed_reservation.token in controller._reservations
+        assert transaction.reservations[1].token not in controller._reservations
+        controller._rollback_controller_private_cpu_generation_transaction(transaction)
+        assert not controller._reservations
+        assert not controller._prepared_cpu_generation_transactions
+    finally:
+        controller.close()
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")
 def test_prepared_cuda_h2d_transaction_rejects_forgery_and_replay():
     """CUDA preflight only: prepared H2D reservations are exact and one-shot."""

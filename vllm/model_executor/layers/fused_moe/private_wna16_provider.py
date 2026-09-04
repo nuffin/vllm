@@ -165,6 +165,86 @@ class _WNA16PreparedCudaH2DTransaction:
 
 
 @dataclass(frozen=True, slots=True)
+class _WNA16CpuGenerationOperands:
+    """Complete CPU operand schema for one unpublished generation."""
+
+    w13_weight_packed: torch.Tensor
+    w2_weight_packed: torch.Tensor
+    w13_weight_scale: torch.Tensor
+    w2_weight_scale: torch.Tensor
+    w13_weight_zero_point: torch.Tensor | None
+    w2_weight_zero_point: torch.Tensor | None
+
+    def __post_init__(self) -> None:
+        """Snapshot every canonical operand at the transaction boundary."""
+        for name in (
+            "w13_weight_packed",
+            "w2_weight_packed",
+            "w13_weight_scale",
+            "w2_weight_scale",
+            "w13_weight_zero_point",
+            "w2_weight_zero_point",
+        ):
+            value = object.__getattribute__(self, name)
+            if value is not None:
+                object.__setattr__(self, name, _copy_canonical_wna16_cpu_operand(value))
+
+    def __getattribute__(self, name: str) -> object:
+        value = object.__getattribute__(self, name)
+        if name in {
+            "w13_weight_packed",
+            "w2_weight_packed",
+            "w13_weight_scale",
+            "w2_weight_scale",
+            "w13_weight_zero_point",
+            "w2_weight_zero_point",
+        } and isinstance(value, torch.Tensor):
+            return value.detach().clone()
+        return value
+
+
+@dataclass(frozen=True, slots=True)
+class _WNA16CpuGenerationTransaction:
+    """Controller-owned, pre-enqueue atomic CPU generation contract.
+
+    This owns immutable candidate-map data, complete operands, exact logical
+    reservations, and a monotonic identity. It is not publishable: no CUDA
+    allocation, H2D, event, map authority, or generation view is issued here.
+    """
+
+    controller: object
+    generation: int
+    operands: _WNA16CpuGenerationOperands
+    candidate_cpu_slot_map: torch.Tensor
+    reservations: tuple[_WNA16SlotReservation, ...]
+    source: _CanonicalWNA16CpuBank
+    token: object
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "candidate_cpu_slot_map",
+            self.candidate_cpu_slot_map.detach().clone().contiguous(),
+        )
+
+    def __getattribute__(self, name: str) -> object:
+        value = object.__getattribute__(self, name)
+        if name == "candidate_cpu_slot_map" and isinstance(value, torch.Tensor):
+            return value.detach().clone()
+        return value
+
+
+@dataclass(frozen=True, slots=True)
+class _WNA16CpuGenerationConstructionRollback:
+    """Controller-private retry ownership after generation construction failed."""
+
+    controller: object
+    reservations: tuple[_WNA16SlotReservation, ...]
+    source: _CanonicalWNA16CpuBank
+    token: object
+
+
+@dataclass(frozen=True, slots=True)
 class _WNA16SlotPlan:
     status: _WNA16SlotPlanStatus
     slot: int | None
@@ -654,6 +734,13 @@ class PrivateWNA16ResidencyController:
         self._prepared_cuda_h2d_transactions: dict[
             object, _WNA16PreparedCudaH2DTransaction
         ] = {}
+        self._prepared_cpu_generation_transactions: dict[
+            object, _WNA16CpuGenerationTransaction
+        ] = {}
+        self._cpu_generation_construction_rollbacks: dict[
+            object, _WNA16CpuGenerationConstructionRollback
+        ] = {}
+        self._next_cpu_generation = 0
         self._retained_cpu_source_slots: dict[object, _WNA16CpuSourceSlotRetention] = {}
         self._cpu_source_slot_retention_queries: set[object] = set()
         self._closed = False
@@ -997,6 +1084,249 @@ class PrivateWNA16ResidencyController:
                 with suppress(BaseException):
                     self._rollback_slot_transaction(reservation)
             raise
+
+    def _prepare_controller_private_cpu_generation_transaction(
+        self, *, expert_ids: tuple[int, ...]
+    ) -> _WNA16CpuGenerationTransaction:
+        """Atomically reserve a complete CPU-only candidate generation.
+
+        All experts are planned from one logical snapshot before a slot is
+        changed. This records the full WNA16 schema and CPU candidate map, but
+        deliberately does not allocate CUDA storage, enqueue H2D, record an
+        event, publish a map, or issue a generation view.
+        """
+        with self._lifecycle_lock:
+            self._retry_controller_private_cpu_generation_construction_rollbacks()
+            bank = self._canonical_cpu_bank
+            if self._closed or bank is None or not self._slots:
+                raise _lifecycle_error("private WNA16 CPU generation is unavailable")
+            if not expert_ids:
+                raise _lifecycle_error("private WNA16 CPU generation has no experts")
+            if any(type(expert_id) is not int for expert_id in expert_ids):
+                raise _lifecycle_error("private WNA16 CPU generation expert is invalid")
+            unique_expert_ids = tuple(dict.fromkeys(expert_ids))
+            if any(
+                expert_id < 0 or expert_id >= bank.global_num_experts
+                for expert_id in unique_expert_ids
+            ):
+                raise _lifecycle_error("private WNA16 CPU generation expert is invalid")
+
+            snapshots = [self._snapshot_slot(slot) for slot in self._slots]
+            planned: list[tuple[int, int, _WNA16LogicalSlotSnapshot]] = []
+            planned_slots: set[int] = set()
+            for expert_id in unique_expert_ids:
+                if any(
+                    snapshot.state is _WNA16SlotState.RESIDENT
+                    and snapshot.expert_id == expert_id
+                    for snapshot in snapshots
+                ):
+                    continue
+                empty = next(
+                    (
+                        index
+                        for index, snapshot in enumerate(snapshots)
+                        if snapshot.state is _WNA16SlotState.ABSENT
+                        and index not in planned_slots
+                    ),
+                    None,
+                )
+                if empty is None:
+                    candidates = [
+                        (snapshot.last_used, index)
+                        for index, snapshot in enumerate(snapshots)
+                        if snapshot.state is _WNA16SlotState.RESIDENT
+                        and snapshot.pins == 0
+                        and index not in planned_slots
+                    ]
+                    if not candidates:
+                        raise _lifecycle_error(
+                            "private WNA16 CPU generation has insufficient capacity"
+                        )
+                    _, empty = min(candidates)
+                previous = snapshots[empty]
+                planned.append((expert_id, empty, previous))
+                planned_slots.add(empty)
+                snapshots[empty] = _WNA16LogicalSlotSnapshot(
+                    _WNA16SlotState.RESERVED_EMPTY
+                    if previous.state is _WNA16SlotState.ABSENT
+                    else _WNA16SlotState.STAGED_REPLACEMENT,
+                    previous.expert_id,
+                    previous.pins,
+                    previous.last_used,
+                )
+
+            candidate = torch.full(
+                (bank.global_num_experts,), -1, dtype=torch.int32, device="cpu"
+            )
+            for slot_index, snapshot in enumerate(snapshots):
+                if snapshot.state is _WNA16SlotState.RESIDENT:
+                    if snapshot.expert_id is None:
+                        raise _lifecycle_error(
+                            "private WNA16 CPU generation is invalid"
+                        )
+                    candidate[snapshot.expert_id] = slot_index
+            for expert_id, slot_index, _ in planned:
+                candidate[expert_id] = slot_index
+            values = candidate.tolist()
+            if (
+                not candidate.is_contiguous()
+                or len({value for value in values if value >= 0})
+                != sum(value >= 0 for value in values)
+                or any(value < -1 or value >= len(self._slots) for value in values)
+            ):
+                raise _lifecycle_error("private WNA16 CPU generation map is invalid")
+
+            reservations: list[_WNA16SlotReservation] = []
+            try:
+                for expert_id, slot_index, previous in planned:
+                    slot = self._slots[slot_index]
+                    if self._snapshot_slot(slot) != previous:
+                        raise _lifecycle_error(
+                            "private WNA16 CPU generation is stale", stale=True
+                        )
+                    slot.state = (
+                        _WNA16SlotState.RESERVED_EMPTY
+                        if previous.state is _WNA16SlotState.ABSENT
+                        else _WNA16SlotState.STAGED_REPLACEMENT
+                    )
+                    reservation = _WNA16SlotReservation(
+                        self, slot_index, expert_id, object(), previous
+                    )
+                    self._reservations[reservation.token] = reservation
+                    reservations.append(reservation)
+                generation = self._next_cpu_generation + 1
+                transaction = _WNA16CpuGenerationTransaction(
+                    controller=self,
+                    generation=generation,
+                    operands=_WNA16CpuGenerationOperands(
+                        bank.w13_weight_packed,
+                        bank.w2_weight_packed,
+                        bank.w13_weight_scale,
+                        bank.w2_weight_scale,
+                        bank.w13_weight_zero_point,
+                        bank.w2_weight_zero_point,
+                    ),
+                    candidate_cpu_slot_map=candidate,
+                    reservations=tuple(reservations),
+                    source=bank,
+                    token=object(),
+                )
+                self._prepared_cpu_generation_transactions[transaction.token] = (
+                    transaction
+                )
+                self._next_cpu_generation = generation
+                return transaction
+            except BaseException:
+                for reservation in reversed(reservations):
+                    with suppress(BaseException):
+                        self._rollback_slot_transaction(reservation)
+                if any(
+                    self._reservations.get(reservation.token) is reservation
+                    for reservation in reservations
+                ):
+                    rollback = _WNA16CpuGenerationConstructionRollback(
+                        self, tuple(reservations), bank, object()
+                    )
+                    self._cpu_generation_construction_rollbacks[rollback.token] = (
+                        rollback
+                    )
+                raise
+
+    def _retry_controller_private_cpu_generation_construction_rollbacks(self) -> None:
+        """Retry controller-owned cleanup left by failed transaction construction."""
+        with self._lifecycle_lock:
+            rollbacks = tuple(self._cpu_generation_construction_rollbacks.values())
+        first_error: BaseException | None = None
+        for rollback in rollbacks:
+            with self._lifecycle_lock:
+                if (
+                    rollback.controller is not self
+                    or rollback.source is not self._canonical_cpu_bank
+                    or self._cpu_generation_construction_rollbacks.get(rollback.token)
+                    is not rollback
+                ):
+                    error = _lifecycle_error(
+                        "private WNA16 CPU generation construction rollback is stale",
+                        stale=True,
+                    )
+                    if first_error is None:
+                        first_error = error
+                    continue
+            for reservation in reversed(rollback.reservations):
+                with self._lifecycle_lock:
+                    owned = self._reservations.get(reservation.token)
+                    if owned is None:
+                        continue
+                    if owned is not reservation:
+                        error = _lifecycle_error(
+                            "private WNA16 CPU generation is stale", stale=True
+                        )
+                        if first_error is None:
+                            first_error = error
+                        continue
+                try:
+                    self._rollback_slot_transaction(reservation)
+                except BaseException as error:
+                    if first_error is None:
+                        first_error = error
+            with self._lifecycle_lock:
+                if not any(
+                    reservation.token in self._reservations
+                    for reservation in rollback.reservations
+                ):
+                    del self._cpu_generation_construction_rollbacks[rollback.token]
+        if first_error is not None:
+            raise first_error
+
+    def _rollback_controller_private_cpu_generation_transaction(
+        self, transaction: _WNA16CpuGenerationTransaction
+    ) -> None:
+        """Release one exact unpublished CPU generation transaction."""
+        with self._lifecycle_lock:
+            if (
+                not isinstance(transaction, _WNA16CpuGenerationTransaction)
+                or transaction.controller is not self
+                or self._closed
+                or self._prepared_cpu_generation_transactions.get(transaction.token)
+                is not transaction
+                or transaction.source is not self._canonical_cpu_bank
+            ):
+                raise _lifecycle_error(
+                    "private WNA16 CPU generation is stale", stale=True
+                )
+
+        first_error: BaseException | None = None
+        for reservation in reversed(transaction.reservations):
+            with self._lifecycle_lock:
+                owned = self._reservations.get(reservation.token)
+                if owned is None:
+                    continue
+                if owned is not reservation:
+                    error = _lifecycle_error(
+                        "private WNA16 CPU generation is stale", stale=True
+                    )
+                    if first_error is None:
+                        first_error = error
+                    continue
+            try:
+                self._rollback_slot_transaction(reservation)
+            except BaseException as error:
+                if first_error is None:
+                    first_error = error
+        if first_error is not None:
+            raise first_error
+
+        with self._lifecycle_lock:
+            if self._prepared_cpu_generation_transactions.get(
+                transaction.token
+            ) is not transaction or any(
+                reservation.token in self._reservations
+                for reservation in transaction.reservations
+            ):
+                raise _lifecycle_error(
+                    "private WNA16 CPU generation is stale", stale=True
+                )
+            del self._prepared_cpu_generation_transactions[transaction.token]
 
     def _rollback_prepared_controller_private_cuda_h2d_transaction(
         self, transaction: _WNA16PreparedCudaH2DTransaction
@@ -1353,6 +1683,8 @@ class PrivateWNA16ResidencyController:
             self._slots.clear()
             self._reservations.clear()
             self._prepared_cuda_h2d_transactions.clear()
+            self._prepared_cpu_generation_transactions.clear()
+            self._cpu_generation_construction_rollbacks.clear()
             self._cpu_source_slot_retention_queries.clear()
 
     def _request_generation_view(
