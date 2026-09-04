@@ -14,9 +14,10 @@ revalidates the exact current lease before outer lifecycle mutation.
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum, auto
 from typing import ClassVar
+from weakref import ReferenceType, ref
 
 import torch
 
@@ -709,6 +710,74 @@ def _snapshot_tensor(tensor: torch.Tensor) -> torch.Tensor:
     return snapshot.copy_(tensor.detach())
 
 
+class _WNA16StableSlotCapability:
+    """Opaque controller-lifecycle capability for stable WNA16 bindings.
+
+    This is a module-internal API boundary, not a security boundary against
+    Python code that deliberately imports private names or bypasses objects.
+    """
+
+    __slots__ = ("_active", "_epoch", "_nonce")
+
+    def __init__(self) -> None:
+        self._active = True
+        self._epoch = 0
+        self._nonce = object()
+
+    def revoke(self) -> None:
+        self._active = False
+        self._epoch += 1
+        self._nonce = object()
+
+
+def _new_controller_wna16_stable_slot_capability() -> _WNA16StableSlotCapability:
+    """Create a capability only for the private controller/provider lifecycle."""
+    return _WNA16StableSlotCapability()
+
+
+@dataclass(frozen=True, slots=True)
+class _WNA16StableSlotStorage:
+    """Controller-issued raw operands and their immutable dispatch fingerprint."""
+
+    source_view: ReferenceType[WNA16GenerationView]
+    source_bundle: WNA16ExpertBundle
+    source_lease: WNA16UseLease
+    source_layer_id: int
+    source_generation: int
+    source_map_generation: int
+    source_lease_generation: int
+    source_lease_token: int
+    w13: torch.Tensor
+    w2: torch.Tensor
+    w13_scale: torch.Tensor
+    w2_scale: torch.Tensor
+    w13_zero: torch.Tensor | None
+    w2_zero: torch.Tensor | None
+    slot_map: torch.Tensor
+    _capability: _WNA16StableSlotCapability = field(repr=False, compare=False)
+    _capability_epoch: int = field(repr=False, compare=False)
+    _capability_nonce: object = field(repr=False, compare=False)
+
+    def revoke(self) -> None:
+        """Invalidate this controller capability; subsequent dispatch fails closed."""
+        self._capability.revoke()
+
+    close = revoke
+
+
+@dataclass(frozen=True, slots=True)
+class _WNA16PrivateDispatchOperands:
+    """Raw private operands after storage association has been checked."""
+
+    w13: torch.Tensor
+    w2: torch.Tensor
+    w13_scale: torch.Tensor
+    w2_scale: torch.Tensor
+    w13_zero: torch.Tensor | None
+    w2_zero: torch.Tensor | None
+    slot_map: torch.Tensor
+
+
 @dataclass(frozen=True, slots=True)
 class WNA16ExpertBundle:
     """Versioned, post-conversion WNA16 tensors for one private slot set.
@@ -763,14 +832,21 @@ class WNA16ExpertBundle:
                 object.__setattr__(self, name, _snapshot_tensor(tensor))
 
 
+class _WeakrefableWNA16GenerationView:
+    __slots__ = ("__weakref__",)
+
+
 @dataclass(frozen=True, slots=True)
-class WNA16GenerationView:
+class WNA16GenerationView(_WeakrefableWNA16GenerationView):
     """Immutable request view joining a complete bundle and private map."""
 
     bundle: WNA16ExpertBundle
     slot_map: torch.Tensor
     map_generation: int
-    use_lease: "WNA16UseLease"
+    use_lease: WNA16UseLease
+    _stable_slot_storage: _WNA16StableSlotStorage | None = field(
+        default=None, init=False, repr=False, compare=False
+    )
 
     def __getattribute__(self, name: str) -> object:
         value = object.__getattribute__(self, name)
@@ -795,6 +871,117 @@ class WNA16UseLease:
     token: int
 
 
+def _stale_wna16_lease(diagnostic: str) -> Phase4UnsupportedError:
+    return Phase4UnsupportedError(Phase4FailureCategory.STALE_LEASE, diagnostic)
+
+
+def _require_current_wna16_source(view: WNA16GenerationView) -> None:
+    """Check the original view/lease association before binding raw storage."""
+    if not isinstance(view, WNA16GenerationView):
+        raise _stale_wna16_lease("WNA16 source view is not current")
+    bundle = object.__getattribute__(view, "bundle")
+    lease = object.__getattribute__(view, "use_lease")
+    if (
+        not isinstance(bundle, WNA16ExpertBundle)
+        or not isinstance(lease, WNA16UseLease)
+        or type(lease.token) is not int
+        or lease.token < 0
+        or lease.layer_id != bundle.layer_id
+        or lease.generation != bundle.generation
+        or lease.bundle is not bundle
+        or object.__getattribute__(view, "map_generation") != bundle.generation
+    ):
+        raise _stale_wna16_lease("generation, map, or lease is stale")
+
+
+def _bind_controller_wna16_slot_storage(
+    view: WNA16GenerationView,
+    capability: _WNA16StableSlotCapability,
+) -> WNA16GenerationView:
+    """Mint and bind raw storage only under a live controller capability."""
+    _require_current_wna16_source(view)
+    if not isinstance(capability, _WNA16StableSlotCapability) or not capability._active:
+        raise _stale_wna16_lease("stable WNA16 controller capability is foreign")
+    existing = object.__getattribute__(view, "_stable_slot_storage")
+    if existing is not None:
+        raise _stale_wna16_lease("stable WNA16 storage binding cannot be reused")
+    bundle = object.__getattribute__(view, "bundle")
+    lease = object.__getattribute__(view, "use_lease")
+    storage = _WNA16StableSlotStorage(
+        source_view=ref(view),
+        source_bundle=bundle,
+        source_lease=lease,
+        source_layer_id=bundle.layer_id,
+        source_generation=bundle.generation,
+        source_map_generation=object.__getattribute__(view, "map_generation"),
+        source_lease_generation=lease.generation,
+        source_lease_token=lease.token,
+        w13=object.__getattribute__(bundle, "w13"),
+        w2=object.__getattribute__(bundle, "w2"),
+        w13_scale=object.__getattribute__(bundle, "w13_scale"),
+        w2_scale=object.__getattribute__(bundle, "w2_scale"),
+        w13_zero=object.__getattribute__(bundle, "w13_zero"),
+        w2_zero=object.__getattribute__(bundle, "w2_zero"),
+        slot_map=object.__getattribute__(view, "slot_map"),
+        _capability=capability,
+        _capability_epoch=capability._epoch,
+        _capability_nonce=capability._nonce,
+    )
+    object.__setattr__(view, "_stable_slot_storage", storage)
+    return view
+
+
+def _private_wna16_dispatch_operands(
+    view: WNA16GenerationView,
+) -> _WNA16PrivateDispatchOperands:
+    """Return raw operands only from an unchanged opaque stable binding."""
+    _require_current_wna16_source(view)
+    storage = object.__getattribute__(view, "_stable_slot_storage")
+    if not isinstance(storage, _WNA16StableSlotStorage):
+        raise _stale_wna16_lease("WNA16 view has no current stable storage binding")
+    if (
+        storage.source_view() is not view
+        or storage._capability_epoch != storage._capability._epoch
+        or storage._capability_nonce is not storage._capability._nonce
+    ):
+        raise _stale_wna16_lease("WNA16 view authority is stale, foreign, or revoked")
+    if (
+        storage.source_bundle is not object.__getattribute__(view, "bundle")
+        or storage.source_lease is not object.__getattribute__(view, "use_lease")
+        or storage.source_map_generation
+        != object.__getattribute__(view, "map_generation")
+    ):
+        raise _stale_wna16_lease("stable WNA16 storage binding is stale")
+    bundle = storage.source_bundle
+    lease = storage.source_lease
+    if (
+        storage.source_layer_id != bundle.layer_id
+        or storage.source_generation != bundle.generation
+        or storage.source_map_generation
+        != object.__getattribute__(view, "map_generation")
+        or storage.source_lease_generation != lease.generation
+        or storage.source_lease_token != lease.token
+        or storage.source_lease is not object.__getattribute__(view, "use_lease")
+        or storage.source_bundle is not object.__getattribute__(view, "bundle")
+    ):
+        raise _stale_wna16_lease("stable WNA16 scalar fingerprint is stale")
+    operands = _WNA16PrivateDispatchOperands(
+        storage.w13, storage.w2, storage.w13_scale, storage.w2_scale,
+        storage.w13_zero, storage.w2_zero, storage.slot_map,
+    )
+    if (
+        object.__getattribute__(bundle, "w13") is not operands.w13
+        or object.__getattribute__(bundle, "w2") is not operands.w2
+        or object.__getattribute__(bundle, "w13_scale") is not operands.w13_scale
+        or object.__getattribute__(bundle, "w2_scale") is not operands.w2_scale
+        or object.__getattribute__(bundle, "w13_zero") is not operands.w13_zero
+        or object.__getattribute__(bundle, "w2_zero") is not operands.w2_zero
+        or object.__getattribute__(view, "slot_map") is not operands.slot_map
+    ):
+        raise _stale_wna16_lease("stable WNA16 storage association is stale")
+    return operands
+
+
 def validate_wna16_generation_view(
     view: WNA16GenerationView,
     *,
@@ -812,6 +999,9 @@ def validate_wna16_generation_view(
             Phase4FailureCategory.VALIDATION,
             "generation view bundle has an invalid type",
         )
+    # Private dispatch validates only controller-issued operands. Resolve the
+    # authority before inspecting any public raw operand snapshot.
+    operands = _private_wna16_dispatch_operands(view)
     int_fields = (
         ("schema_version", bundle.schema_version),
         ("layer_id", bundle.layer_id),
@@ -875,8 +1065,8 @@ def validate_wna16_generation_view(
             Phase4FailureCategory.VALIDATION,
             "invalid WNA16 quantization metadata",
         )
-    weights = (bundle.w13, bundle.w2)
-    scales = (bundle.w13_scale, bundle.w2_scale)
+    weights = (operands.w13, operands.w2)
+    scales = (operands.w13_scale, operands.w2_scale)
     tensors = weights + scales
     # Triton consumes N-first uint8 tensors: [S, N_out, K / 2] for
     # W4A16 and [S, N_out, K] for W8A16. Scales are [S, N_out, K / 32].
@@ -891,7 +1081,7 @@ def validate_wna16_generation_view(
             Phase4FailureCategory.VALIDATION,
             "bundle tensors must be contiguous post-conversion tensors",
         )
-    if any(tensor.device != bundle.w13.device for tensor in tensors):
+    if any(tensor.device != operands.w13.device for tensor in tensors):
         raise Phase4UnsupportedError(
             Phase4FailureCategory.VALIDATION,
             "bundle tensors must share a device",
@@ -952,13 +1142,13 @@ def validate_wna16_generation_view(
             Phase4FailureCategory.VALIDATION,
             "WNA16 scale shapes do not match packed weight dimensions",
         )
-    zero_tensors = (bundle.w13_zero, bundle.w2_zero)
+    zero_tensors = (operands.w13_zero, operands.w2_zero)
     if any(
         zero is not None
         and (
             not isinstance(zero, torch.Tensor)
             or not zero.is_contiguous()
-            or zero.device != bundle.w13.device
+            or zero.device != operands.w13.device
             or zero.dtype != torch.uint8
         )
         for zero in zero_tensors
@@ -970,16 +1160,17 @@ def validate_wna16_generation_view(
         )
     if (
         bundle.symmetric
-        and (bundle.w13_zero is not None or bundle.w2_zero is not None)
+        and (operands.w13_zero is not None or operands.w2_zero is not None)
     ) or (
         not bundle.symmetric
-        and (bundle.w13_zero is None or bundle.w2_zero is None)
+        and (operands.w13_zero is None or operands.w2_zero is None)
     ):
         raise Phase4UnsupportedError(
             Phase4FailureCategory.VALIDATION,
             "incomplete symmetric/asymmetric zero-point state",
         )
     if not bundle.symmetric:
+        assert operands.w13_zero is not None and operands.w2_zero is not None
         expected_zero_shapes = (
             (bundle.slot_count, w13_rows // 2, w13_input // bundle.group_size)
             if bundle.num_bits == 4
@@ -988,14 +1179,14 @@ def validate_wna16_generation_view(
             if bundle.num_bits == 4
             else (bundle.slot_count, w2_rows, w2_input // bundle.group_size),
         )
-        if tuple(bundle.w13_zero.shape) != expected_zero_shapes[0] or tuple(
-            bundle.w2_zero.shape
+        if tuple(operands.w13_zero.shape) != expected_zero_shapes[0] or tuple(
+            operands.w2_zero.shape
         ) != expected_zero_shapes[1]:
             raise Phase4UnsupportedError(
                 Phase4FailureCategory.VALIDATION,
                 "zero-point tensor shapes do not match Triton layout",
             )
-    slot_map = view.slot_map
+    slot_map = operands.slot_map
     if (
         not isinstance(slot_map, torch.Tensor)
         or slot_map.ndim != 1
@@ -1007,7 +1198,7 @@ def validate_wna16_generation_view(
             Phase4FailureCategory.VALIDATION,
             "slot_map must be contiguous int32 [global_num_experts]",
         )
-    if slot_map.device != bundle.w13.device:
+    if slot_map.device != operands.w13.device:
         raise Phase4UnsupportedError(
             Phase4FailureCategory.VALIDATION,
             "slot_map.device must match bundle tensor device",
@@ -1050,13 +1241,15 @@ def validate_private_wna16_dispatch_inputs(
     """Validate complete private-dispatch inputs before a Triton launch."""
     validate_wna16_generation_view(view, layer_id=layer_id)
     bundle = view.bundle
+    operands = _private_wna16_dispatch_operands(view)
     if global_num_experts != bundle.global_num_experts:
         raise Phase4UnsupportedError(
             Phase4FailureCategory.VALIDATION,
             "private WNA16 global expert count mismatch",
         )
     tensors = (
-        bundle.w13, bundle.w2, bundle.w13_scale, bundle.w2_scale, view.slot_map,
+        operands.w13, operands.w2, operands.w13_scale, operands.w2_scale,
+        operands.slot_map,
         topk_ids, topk_weights,
     )
     if (
@@ -1085,7 +1278,7 @@ def validate_private_wna16_dispatch_inputs(
             Phase4FailureCategory.VALIDATION,
             "private WNA16 router IDs are outside the global expert domain",
         )
-    selected_slots = view.slot_map.index_select(0, flattened_ids.to(torch.long))
+    selected_slots = operands.slot_map.index_select(0, flattened_ids.to(torch.long))
     if bool((selected_slots == -1).any()):
         raise Phase4UnsupportedError(
             Phase4FailureCategory.VALIDATION,

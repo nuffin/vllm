@@ -6,7 +6,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from types import SimpleNamespace
 from typing import cast
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 import torch
@@ -20,6 +20,10 @@ from vllm.model_executor.layers.fused_moe.expert_residency import (
     WNA16ExpertBundle,
     WNA16GenerationView,
     WNA16UseLease,
+    _bind_controller_wna16_slot_storage,
+    _new_controller_wna16_stable_slot_capability,
+    _private_wna16_dispatch_operands,
+    validate_wna16_generation_view,
 )
 from vllm.model_executor.layers.fused_moe.modular_kernel import (
     FusedMoEKernelModularImpl,
@@ -85,12 +89,22 @@ def private_view() -> WNA16GenerationView:
         w2_scale=torch.ones((2, 32, 1)),
     )
     lease = WNA16UseLease(layer_id=3, generation=9, bundle=bundle, token=1)
-    return WNA16GenerationView(
+    view = WNA16GenerationView(
         bundle,
         torch.tensor([0, -1, 1, -1], dtype=torch.int32),
         9,
         lease,
     )
+    return _bind_controller_wna16_slot_storage(
+        view, _new_controller_wna16_stable_slot_capability()
+    )
+
+
+def unbound_private_view() -> WNA16GenerationView:
+    """A public ABI view has snapshots but cannot issue private storage."""
+    view = private_view()
+    object.__setattr__(view, "_stable_slot_storage", None)
+    return view
 
 
 def test_default_off_is_explicit_and_fail_closed():
@@ -456,6 +470,43 @@ def test_wna16_private_dispatch_rejects_cpu_before_kernel():
     kernel.apply_private_wna16.assert_not_called()
 
 
+def test_stale_private_view_calls_neither_kernel_path():
+    kernel = MagicMock()
+    method = SimpleNamespace(
+        is_monolithic=False,
+        moe_kernel=kernel,
+        wna16_backend=WNA16MoEBackend.TRITON,
+        num_bits=4,
+        symmetric=True,
+        group_size=32,
+        actorder=None,
+    )
+    view = private_view()
+    object.__setattr__(
+        view, "slot_map", torch.tensor([0, -1, 1, -1], dtype=torch.int32)
+    )
+    layer = SimpleNamespace(
+        use_ep=False,
+        activation=MagicMock(),
+        global_num_experts=4,
+        apply_router_weight_on_input=False,
+    )
+    with pytest.raises(Phase4UnsupportedError) as error:
+        CompressedTensorsWNA16MoEMethod.apply(
+            method,
+            layer=layer,
+            x=torch.ones(1, 2),
+            topk_weights=torch.ones(1, 2),
+            topk_ids=torch.tensor([[0, 2]], dtype=torch.int32),
+            shared_experts=None,
+            shared_experts_input=None,
+            generation_view=view,
+        )
+    assert error.value.category is Phase4FailureCategory.STALE_LEASE
+    kernel.apply_private_wna16.assert_not_called()
+    kernel.apply.assert_not_called()
+
+
 def test_private_kernel_preserves_lora_and_shared_expert_contract():
     hidden_states = torch.ones(1, 2)
     lora_context = SimpleNamespace(original_hidden_states=None)
@@ -516,6 +567,86 @@ def test_private_kernel_preserves_lora_and_shared_expert_contract():
     )
 
 
+def test_wna16_private_dispatch_cpu_mock_forwards_raw_stable_operands():
+    kernel = MagicMock()
+    method = SimpleNamespace(
+        is_monolithic=False,
+        moe_kernel=kernel,
+        wna16_backend=WNA16MoEBackend.TRITON,
+        num_bits=4,
+        symmetric=True,
+        group_size=32,
+        actorder=None,
+    )
+    view = private_view()
+    operands = _private_wna16_dispatch_operands(view)
+    layer = SimpleNamespace(
+        use_ep=False,
+        activation=MagicMock(),
+        global_num_experts=4,
+        apply_router_weight_on_input=False,
+    )
+    x = torch.ones(1, 2)
+    topk_weights = torch.ones(1, 2)
+    topk_ids = torch.tensor([[2, 0]], dtype=torch.int32)
+    bundle_getattribute = WNA16ExpertBundle.__getattribute__
+    view_getattribute = WNA16GenerationView.__getattribute__
+
+    def guard_bundle(self, name):
+        if name in WNA16ExpertBundle._TENSOR_FIELDS:
+            raise AssertionError("production dispatch read a public tensor snapshot")
+        return bundle_getattribute(self, name)
+
+    def guard_view(self, name):
+        if name == "slot_map":
+            raise AssertionError("production dispatch read a public map snapshot")
+        return view_getattribute(self, name)
+
+    with (
+        patch(
+            "vllm.model_executor.layers.quantization.compressed_tensors."
+            "compressed_tensors_moe.compressed_tensors_moe_wna16."
+            "validate_private_wna16_dispatch_inputs"
+        ) as validate,
+        patch("torch.cuda.is_current_stream_capturing", return_value=False),
+        patch.object(WNA16ExpertBundle, "__getattribute__", guard_bundle),
+        patch.object(WNA16GenerationView, "__getattribute__", guard_view),
+    ):
+        CompressedTensorsWNA16MoEMethod.apply(
+            method,
+            layer=layer,
+            x=x,
+            topk_weights=topk_weights,
+            topk_ids=topk_ids,
+            shared_experts=None,
+            shared_experts_input=None,
+            generation_view=view,
+        )
+
+    validate.assert_called_once_with(
+        view,
+        hidden_states=x,
+        topk_ids=topk_ids,
+        topk_weights=topk_weights,
+        global_num_experts=4,
+        layer_id=3,
+    )
+    call = kernel.apply_private_wna16.call_args
+    assert call.args[:9] == (
+        x,
+        operands.w13,
+        operands.w2,
+        operands.w13_scale,
+        operands.w2_scale,
+        operands.w13_zero,
+        operands.w2_zero,
+        topk_weights,
+        topk_ids,
+    )
+    assert call.kwargs["slot_map"] is operands.slot_map
+    kernel.apply.assert_not_called()
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")
 def test_wna16_private_dispatch_cuda_forwarding_seam():
     kernel = MagicMock()
@@ -554,6 +685,10 @@ def test_wna16_private_dispatch_cuda_forwarding_seam():
         map_generation=9,
         use_lease=lease,
     )
+    view = _bind_controller_wna16_slot_storage(
+        view, _new_controller_wna16_stable_slot_capability()
+    )
+    operands = _private_wna16_dispatch_operands(view)
     layer = SimpleNamespace(
         use_ep=False,
         activation=MagicMock(),
@@ -581,18 +716,17 @@ def test_wna16_private_dispatch_cuda_forwarding_seam():
     assert call.args[0] is x
     for received, expected in zip(
         call.args[1:5],
-        (private_bundle.w13, private_bundle.w2,
-         private_bundle.w13_scale, private_bundle.w2_scale),
+        (operands.w13, operands.w2, operands.w13_scale, operands.w2_scale),
         strict=True,
     ):
+        assert received is expected
         assert received.is_cuda
-        assert torch.equal(received, expected)
     assert call.args[5] is None
     assert call.args[6] is None
     assert call.args[7] is topk_weights
     assert call.args[8] is topk_ids
+    assert call.kwargs["slot_map"] is operands.slot_map
     assert call.kwargs["slot_map"].is_cuda
-    assert torch.equal(call.kwargs["slot_map"], view.slot_map)
     assert call.kwargs["global_num_experts"] == 4
     assert call.kwargs["shared_experts"] is None
     assert call.kwargs["shared_experts_input"] is None
@@ -620,6 +754,19 @@ def test_selected_private_layer_fails_closed_without_controller_factory():
     assert layer._private_wna16_generation_view_provider is None
 
 
+def test_public_view_cannot_issue_or_extract_stable_slot_storage():
+    view = unbound_private_view()
+
+    for operation in (validate_wna16_generation_view, _private_wna16_dispatch_operands):
+        with pytest.raises(Phase4UnsupportedError) as error:
+            operation(view)
+        assert error.value.category is Phase4FailureCategory.STALE_LEASE
+
+    with pytest.raises(Phase4UnsupportedError) as error:
+        _bind_controller_wna16_slot_storage(view, object())  # type: ignore[arg-type]
+    assert error.value.category is Phase4FailureCategory.STALE_LEASE
+
+
 def test_registered_controller_factory_binds_dynamic_view_after_routing():
     adapter = Phase4GpuResidencyAdapter(
         enabled=True,
@@ -632,7 +779,7 @@ def test_registered_controller_factory_binds_dynamic_view_after_routing():
     routed_experts = mocked_routed_experts(adapter)
     ids = torch.tensor([[3, 1]], dtype=torch.int32)
     weights = torch.tensor([[0.25, 0.75]])
-    view = private_view()
+    view = unbound_private_view()
     factory_requests = []
     provider_calls = []
 
@@ -776,18 +923,20 @@ def test_registration_close_revokes_an_already_bound_provider():
 
     def provider(**_):
         calls.append(True)
-        return private_view()
+        return unbound_private_view()
 
     registration = register_private_wna16_provider_factory(lambda _: provider)
     bind_private_wna16_generation_view_provider(layer_id=3, routed_experts=layer)
-    assert (
-        layer.get_private_wna16_generation_view(
-            topk_ids=torch.tensor([[3, 1]], dtype=torch.int32),
-            topk_weights=torch.tensor([[0.25, 0.75]]),
-        )
-        is not None
+    issued = layer.get_private_wna16_generation_view(
+        topk_ids=torch.tensor([[3, 1]], dtype=torch.int32),
+        topk_weights=torch.tensor([[0.25, 0.75]]),
     )
+    assert issued is not None
     registration.close()
+
+    with pytest.raises(Phase4UnsupportedError) as error:
+        _private_wna16_dispatch_operands(issued)
+    assert error.value.category is Phase4FailureCategory.STALE_LEASE
 
     with pytest.raises(Phase4UnsupportedError) as error:
         layer.get_private_wna16_generation_view(
@@ -797,6 +946,37 @@ def test_registration_close_revokes_an_already_bound_provider():
 
     assert error.value.category is Phase4FailureCategory.STALE_LEASE
     assert calls == [True]
+
+
+def test_provider_close_during_dispatch_rejects_before_stable_binding():
+    adapter = Phase4GpuResidencyAdapter(
+        enabled=True,
+        model_family="Qwen3-30B-A3B",
+        quantization="WNA16",
+        backend_supports_dynamic_map=True,
+        private_dispatch_enabled=True,
+        private_dispatch_layer_id=3,
+    )
+    layer = mocked_routed_experts(adapter)
+    registration = None
+    returned_view = unbound_private_view()
+
+    def provider(**_):
+        assert registration is not None
+        registration.close()
+        return returned_view
+
+    registration = register_private_wna16_provider_factory(lambda _: provider)
+    bind_private_wna16_generation_view_provider(layer_id=3, routed_experts=layer)
+
+    with pytest.raises(Phase4UnsupportedError) as error:
+        layer.get_private_wna16_generation_view(
+            topk_ids=torch.tensor([[3, 1]], dtype=torch.int32),
+            topk_weights=torch.tensor([[0.25, 0.75]]),
+        )
+
+    assert error.value.category is Phase4FailureCategory.STALE_LEASE
+    assert object.__getattribute__(returned_view, "_stable_slot_storage") is None
 
 
 def test_stale_close_cannot_revoke_same_factory_replacement():
@@ -810,7 +990,7 @@ def test_stale_close_cannot_revoke_same_factory_replacement():
     )
 
     def factory(_):
-        return lambda **_: private_view()
+        return lambda **_: unbound_private_view()
 
     first = register_private_wna16_provider_factory(factory)
     first.close()

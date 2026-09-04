@@ -26,6 +26,7 @@ from vllm.model_executor.layers.fused_moe.expert_residency import (
     Phase4FailureCategory,
     Phase4UnsupportedError,
     WNA16GenerationView,
+    _private_wna16_dispatch_operands,
     validate_private_wna16_dispatch_inputs,
 )
 from vllm.model_executor.layers.fused_moe.oracle.int_wna16 import (
@@ -716,6 +717,7 @@ class CompressedTensorsWNA16MoEMethod(CompressedTensorsMoEMethod):
                 global_num_experts=layer.global_num_experts,
                 layer_id=bundle.layer_id,
             )
+            operands = _private_wna16_dispatch_operands(generation_view)
             is_capturing = getattr(torch.cuda, "is_current_stream_capturing", None)
             if is_capturing is not None and is_capturing():
                 raise Phase4UnsupportedError(
@@ -724,17 +726,17 @@ class CompressedTensorsWNA16MoEMethod(CompressedTensorsMoEMethod):
                 )
             return self.moe_kernel.apply_private_wna16(
                 x,
-                bundle.w13,
-                bundle.w2,
-                bundle.w13_scale,
-                bundle.w2_scale,
-                bundle.w13_zero,
-                bundle.w2_zero,
+                operands.w13,
+                operands.w2,
+                operands.w13_scale,
+                operands.w2_scale,
+                operands.w13_zero,
+                operands.w2_zero,
                 topk_weights,
                 topk_ids,
                 activation=layer.activation,
                 global_num_experts=layer.global_num_experts,
-                slot_map=generation_view.slot_map,
+                slot_map=operands.slot_map,
                 apply_router_weight_on_input=layer.apply_router_weight_on_input,
                 shared_experts=shared_experts,
                 shared_experts_input=shared_experts_input,

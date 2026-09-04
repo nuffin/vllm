@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+import gc
+import weakref
 from dataclasses import astuple, replace
 from random import Random
 
@@ -10,10 +12,10 @@ import pytest
 import torch
 
 from vllm.model_executor.layers.fused_moe.expert_residency import (
+    EventKind,
     ExpertBundle,
     ExpertKey,
     ExpertResidencyTable,
-    EventKind,
     LoadStatus,
     Phase4FailureCategory,
     Phase4GpuResidencyAdapter,
@@ -23,6 +25,9 @@ from vllm.model_executor.layers.fused_moe.expert_residency import (
     WNA16ExpertBundle,
     WNA16GenerationView,
     WNA16UseLease,
+    _bind_controller_wna16_slot_storage,
+    _new_controller_wna16_stable_slot_capability,
+    _private_wna16_dispatch_operands,
     validate_private_wna16_dispatch_inputs,
     validate_wna16_generation_view,
 )
@@ -57,7 +62,14 @@ def private_view(slot_map: torch.Tensor | None = None) -> WNA16GenerationView:
     if slot_map is None:
         slot_map = torch.tensor([0, -1, 1, -1], dtype=torch.int32)
     lease = WNA16UseLease(layer_id=3, generation=9, bundle=bundle, token=1)
-    return WNA16GenerationView(bundle, slot_map, 9, lease)
+    view = WNA16GenerationView(bundle, slot_map, 9, lease)
+    return bind_private_view(view)
+
+
+def bind_private_view(view: WNA16GenerationView) -> WNA16GenerationView:
+    return _bind_controller_wna16_slot_storage(
+        view, _new_controller_wna16_stable_slot_capability()
+    )
 
 
 def test_wna16_private_view_validates_complete_bundle_and_map():
@@ -73,8 +85,11 @@ def test_wna16_private_view_accepts_actual_triton_n_first_layout():
 def test_wna16_private_view_rejects_backend_layout_mismatch():
     view = private_view()
     bundle = replace(view.bundle, backend="humming")
+    view = bind_private_view(
+        WNA16GenerationView(bundle, view.slot_map, 9, WNA16UseLease(3, 9, bundle, 1))
+    )
     with pytest.raises(Phase4UnsupportedError, match="backend"):
-        validate_wna16_generation_view(replace(view, bundle=bundle))
+        validate_wna16_generation_view(view)
 
 
 def test_wna16_private_view_rejects_slot_map_on_different_device():
@@ -106,12 +121,12 @@ def test_wna16_private_view_rejects_slot_map_on_different_device():
 def test_wna16_private_view_rejects_malformed_tensor_schema(
     field: str, value: torch.Tensor, message: str
 ):
-    view = private_view()
-    bundle = replace(view.bundle, **{field: value})
-    view = replace(
-        view,
-        bundle=bundle,
-        use_lease=WNA16UseLease(3, 9, bundle, 1),
+    original = private_view()
+    bundle = replace(original.bundle, **{field: value})
+    view = bind_private_view(
+        WNA16GenerationView(
+            bundle, original.slot_map, 9, WNA16UseLease(3, 9, bundle, 1)
+        )
     )
 
     with pytest.raises(Phase4UnsupportedError, match=message) as error:
@@ -177,9 +192,13 @@ def test_private_dispatch_accepts_explicit_bound_layer():
     (("quant_type", "invalid"), ("num_bits", 16), ("group_size", 0)),
 )
 def test_wna16_private_view_rejects_invalid_quantization_metadata(field, value):
-    view = private_view()
-    bundle = replace(view.bundle, **{field: value})
-    view = replace(view, bundle=bundle)
+    original = private_view()
+    bundle = replace(original.bundle, **{field: value})
+    view = bind_private_view(
+        WNA16GenerationView(
+            bundle, original.slot_map, 9, WNA16UseLease(3, 9, bundle, 1)
+        )
+    )
     with pytest.raises(Phase4UnsupportedError) as error:
         validate_wna16_generation_view(view)
     assert error.value.category is Phase4FailureCategory.VALIDATION
@@ -204,8 +223,161 @@ def test_wna16_private_view_snapshots_input_tensors():
         bundle=bundle,
         use_lease=WNA16UseLease(3, 9, bundle, 1),
     )
-    validate_wna16_generation_view(view)
+    with pytest.raises(Phase4UnsupportedError) as error:
+        validate_wna16_generation_view(view)
+    assert error.value.category is Phase4FailureCategory.STALE_LEASE
     assert torch.count_nonzero(view.bundle.w13) == 0
+
+
+def test_wna16_stable_slot_storage_keeps_private_identity_and_public_snapshots():
+    view = private_view()
+    stable_view = view
+    storage = object.__getattribute__(stable_view, "_stable_slot_storage")
+
+    assert storage.source_view() is stable_view
+    operands = _private_wna16_dispatch_operands(stable_view)
+    assert operands.w13 is storage.w13
+    assert operands.w2 is storage.w2
+    assert operands.w13_scale is storage.w13_scale
+    assert operands.w2_scale is storage.w2_scale
+    assert operands.w13_zero is storage.w13_zero
+    assert operands.w2_zero is storage.w2_zero
+    assert operands.slot_map is storage.slot_map
+    public_w13 = stable_view.bundle.w13
+    public_slot_map = stable_view.slot_map
+    assert public_w13 is not storage.w13
+    assert public_slot_map is not storage.slot_map
+    public_w13.fill_(7)
+    public_slot_map.fill_(-1)
+    assert torch.count_nonzero(operands.w13) == 0
+    assert torch.equal(operands.slot_map, torch.tensor([0, -1, 1, -1]))
+    validate_wna16_generation_view(stable_view)
+
+
+def test_wna16_stable_slot_storage_mismatch_fails_closed():
+    view = private_view()
+    stable_view = view
+    storage = object.__getattribute__(stable_view, "_stable_slot_storage")
+    object.__setattr__(stable_view, "slot_map", storage.slot_map.clone())
+
+    with pytest.raises(Phase4UnsupportedError) as error:
+        validate_wna16_generation_view(stable_view)
+    assert error.value.category is Phase4FailureCategory.STALE_LEASE
+
+
+def test_wna16_stable_storage_rejects_stale_foreign_and_forged_sources():
+    view = private_view()
+    stale = replace(view, use_lease=WNA16UseLease(3, 8, view.bundle, 1))
+    foreign = private_view()
+    storage = object.__getattribute__(view, "_stable_slot_storage")
+
+    for candidate, candidate_storage in (
+        (stale, None),
+        (foreign, storage),
+        (view, object()),
+    ):
+        with pytest.raises(Phase4UnsupportedError) as error:
+            if candidate_storage is None:
+                _bind_controller_wna16_slot_storage(
+                    candidate, _new_controller_wna16_stable_slot_capability()
+                )
+            else:
+                _bind_controller_wna16_slot_storage(
+                    candidate, candidate_storage
+                )
+        assert error.value.category is Phase4FailureCategory.STALE_LEASE
+
+
+def test_wna16_stable_slot_storage_does_not_keep_source_view_alive():
+    source = private_view()
+    storage = object.__getattribute__(source, "_stable_slot_storage")
+    source_ref = weakref.ref(source)
+
+    del source
+    gc.collect()
+
+    assert source_ref() is None
+    assert storage.source_view() is None
+
+
+def test_wna16_stable_slot_storage_rejects_extraction_after_source_view_gc():
+    source = private_view()
+    storage = object.__getattribute__(source, "_stable_slot_storage")
+    source_ref = weakref.ref(source)
+    candidate = replace(source)
+    object.__setattr__(candidate, "_stable_slot_storage", storage)
+
+    del source
+    gc.collect()
+
+    assert source_ref() is None
+    with pytest.raises(Phase4UnsupportedError) as error:
+        _private_wna16_dispatch_operands(candidate)
+    assert error.value.category is Phase4FailureCategory.STALE_LEASE
+
+
+def test_wna16_unbound_or_replaced_view_cannot_extract_private_operands():
+    view = private_view()
+    unbound = replace(view)
+    replaced_map = replace(view)
+    object.__setattr__(replaced_map, "slot_map", view.slot_map.clone())
+
+    for candidate in (unbound, replaced_map):
+        for operation in (
+            validate_wna16_generation_view,
+            _private_wna16_dispatch_operands,
+        ):
+            with pytest.raises(Phase4UnsupportedError) as error:
+                operation(candidate)
+            assert error.value.category is Phase4FailureCategory.STALE_LEASE
+
+
+def test_wna16_stable_slot_fingerprint_rejects_each_raw_operand_replacement():
+    for field in (
+        "w13", "w2", "w13_scale", "w2_scale", "w13_zero", "w2_zero", "slot_map"
+    ):
+        view = private_view()
+        storage = object.__getattribute__(view, "_stable_slot_storage")
+        if field == "slot_map":
+            object.__setattr__(view, field, storage.slot_map.clone())
+        elif field.endswith("_zero"):
+            object.__setattr__(view.bundle, field, torch.zeros((1,), dtype=torch.uint8))
+        else:
+            object.__setattr__(view.bundle, field, getattr(storage, field).clone())
+        for operation in (
+            validate_wna16_generation_view,
+            _private_wna16_dispatch_operands,
+        ):
+            with pytest.raises(Phase4UnsupportedError) as error:
+                operation(view)
+            assert error.value.category is Phase4FailureCategory.STALE_LEASE
+
+
+@pytest.mark.parametrize(
+    ("target", "field", "value"),
+    (
+        ("view", "map_generation", 10),
+        ("lease", "generation", 10),
+        ("lease", "token", 2),
+    ),
+)
+def test_wna16_stable_slot_fingerprint_rejects_scalar_mutation(target, field, value):
+    view = private_view()
+    target_object = view if target == "view" else view.use_lease
+    object.__setattr__(target_object, field, value)
+    with pytest.raises(Phase4UnsupportedError) as error:
+        _private_wna16_dispatch_operands(view)
+    assert error.value.category is Phase4FailureCategory.STALE_LEASE
+
+
+def test_wna16_stable_slot_revoke_and_close_fail_closed():
+    for method_name in ("revoke", "close"):
+        view = private_view()
+        storage = object.__getattribute__(view, "_stable_slot_storage")
+        getattr(storage, method_name)()
+        with pytest.raises(Phase4UnsupportedError) as error:
+            validate_wna16_generation_view(view)
+        assert error.value.category is Phase4FailureCategory.STALE_LEASE
 
 
 def test_wna16_private_view_rejects_stale_or_unassociated_lease():
@@ -234,8 +406,9 @@ def test_wna16_private_view_rejects_asymmetric_zero_point_mismatch():
         bundle=bundle,
         use_lease=WNA16UseLease(3, 9, bundle, 1),
     )
-    with pytest.raises(Phase4UnsupportedError, match="shapes"):
+    with pytest.raises(Phase4UnsupportedError) as error:
         validate_wna16_generation_view(view)
+    assert error.value.category is Phase4FailureCategory.STALE_LEASE
 
 
 @pytest.mark.parametrize(
@@ -255,8 +428,9 @@ def test_wna16_private_view_rejects_malformed_zero_point_tensor(zero):
         bundle=bundle,
         use_lease=WNA16UseLease(3, 9, bundle, 1),
     )
-    with pytest.raises(Phase4UnsupportedError, match="zero-point"):
+    with pytest.raises(Phase4UnsupportedError) as error:
         validate_wna16_generation_view(view)
+    assert error.value.category is Phase4FailureCategory.STALE_LEASE
 
 
 def test_layer_qualified_keys_are_immutable_and_reject_negative_ids():

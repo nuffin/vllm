@@ -21,6 +21,9 @@ from vllm.model_executor.layers.fused_moe.expert_residency import (
     Phase4FailureCategory,
     Phase4UnsupportedError,
     WNA16GenerationView,
+    _bind_controller_wna16_slot_storage,
+    _new_controller_wna16_stable_slot_capability,
+    _WNA16StableSlotCapability,
 )
 
 if TYPE_CHECKING:
@@ -62,6 +65,7 @@ class PrivateWNA16ProviderFactory(Protocol):
 @dataclass(slots=True)
 class _ActiveRegistration:
     factory: PrivateWNA16ProviderFactory
+    capability: _WNA16StableSlotCapability
     closed: bool = False
 
 
@@ -93,6 +97,7 @@ class PrivateWNA16ProviderFactoryRegistration:
             if self._registration.closed:
                 return
             self._registration.closed = True
+            self._registration.capability.revoke()
             if _active_registration is self._registration:
                 _active_registration = None
 
@@ -101,6 +106,7 @@ class PrivateWNA16ProviderFactoryRegistration:
 class _RevocablePrivateWNA16Provider:
     registration: PrivateWNA16ProviderFactoryRegistration
     provider: PrivateWNA16GenerationViewProvider
+    capability: _WNA16StableSlotCapability
 
     def __call__(
         self,
@@ -114,13 +120,20 @@ class _RevocablePrivateWNA16Provider:
                     "private WNA16 provider binding has been revoked", stale=True
                 )
         try:
-            return self.provider(topk_ids=topk_ids, topk_weights=topk_weights)
+            view = self.provider(topk_ids=topk_ids, topk_weights=topk_weights)
         except Phase4UnsupportedError:
             raise
         except Exception as error:
             raise _lifecycle_error(
                 "private WNA16 controller provider failed during dispatch"
             ) from error
+        with _registry_lock:
+            if self.registration._registration.closed:
+                raise _lifecycle_error(
+                    "private WNA16 provider binding was revoked during dispatch",
+                    stale=True,
+                )
+            return _bind_controller_wna16_slot_storage(view, self.capability)
 
 
 class PrivateWNA16ResidencyController:
@@ -159,7 +172,9 @@ def register_private_wna16_provider_factory(
             raise _lifecycle_error(
                 "a private WNA16 provider factory is already registered"
             )
-        registration = _ActiveRegistration(factory)
+        registration = _ActiveRegistration(
+            factory, _new_controller_wna16_stable_slot_capability()
+        )
         _active_registration = registration
         return PrivateWNA16ProviderFactoryRegistration(registration)
 
@@ -198,5 +213,8 @@ def bind_private_wna16_generation_view_provider(
             )
         binding = PrivateWNA16ProviderFactoryRegistration(registration)
     routed_experts.set_private_wna16_generation_view_provider(
-        _RevocablePrivateWNA16Provider(binding, provider), layer_id=layer_id
+        _RevocablePrivateWNA16Provider(
+            binding, provider, registration.capability
+        ),
+        layer_id=layer_id,
     )
