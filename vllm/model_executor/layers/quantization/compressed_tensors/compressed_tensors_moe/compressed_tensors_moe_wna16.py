@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import math
+import sys
+from contextlib import suppress
 from fractions import Fraction
 from typing import Any
 
@@ -35,6 +37,15 @@ from vllm.model_executor.layers.fused_moe.oracle.int_wna16 import (
     make_wna16_moe_kernel,
     make_wna16_moe_quant_config,
     select_wna16_moe_backend,
+)
+from vllm.model_executor.layers.fused_moe.private_wna16_provider import (
+    acquire_private_wna16_request_use,
+    begin_private_wna16_request_enqueue,
+    cancel_private_wna16_issued_request_use,
+    mark_private_wna16_request_dispatched,
+    quarantine_private_wna16_request_use_without_fence,
+    release_private_wna16_request_use_pending,
+    release_private_wna16_request_use_without_dispatch,
 )
 from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors_moe import (  # noqa E501
     CompressedTensorsMoEMethod,
@@ -676,71 +687,140 @@ class CompressedTensorsWNA16MoEMethod(CompressedTensorsMoEMethod):
         transient_expert_map: torch.Tensor | None = None,
         generation_view: WNA16GenerationView | None = None,
     ) -> torch.Tensor:
-        assert not self.is_monolithic
-        assert self.moe_kernel is not None
         if generation_view is not None:
-            if transient_expert_map is not None:
-                raise Phase4UnsupportedError(
-                    Phase4FailureCategory.VALIDATION,
-                    "generation_view and transient_expert_map are mutually exclusive",
+            try:
+                assert not self.is_monolithic
+                assert self.moe_kernel is not None
+                if transient_expert_map is not None:
+                    raise Phase4UnsupportedError(
+                        Phase4FailureCategory.VALIDATION,
+                        "generation_view and transient_expert_map are mutually "
+                        "exclusive",
+                    )
+                if self.wna16_backend != WNA16MoEBackend.TRITON:
+                    raise Phase4UnsupportedError(
+                        Phase4FailureCategory.UNSUPPORTED_DYNAMIC_MAP,
+                        "private WNA16 dispatch requires the Triton backend",
+                    )
+                if layer.use_ep:
+                    raise Phase4UnsupportedError(
+                        Phase4FailureCategory.UNSUPPORTED_DYNAMIC_MAP,
+                        "private WNA16 dispatch does not support expert parallelism",
+                    )
+                bundle = generation_view.bundle
+                if (
+                    bundle.quant_type != f"W{self.num_bits}A16"
+                    or bundle.num_bits != self.num_bits
+                    or bundle.symmetric is not self.symmetric
+                    or bundle.group_size != self.group_size
+                    or bundle.group_size != 32
+                    or self.actorder is not None
+                    or bundle.act_order
+                ):
+                    raise Phase4UnsupportedError(
+                        Phase4FailureCategory.VALIDATION,
+                        "private WNA16 bundle quantization does not match "
+                        "layer quantization",
+                    )
+                validate_private_wna16_dispatch_inputs(
+                    generation_view,
+                    hidden_states=x,
+                    topk_ids=topk_ids,
+                    topk_weights=topk_weights,
+                    global_num_experts=layer.global_num_experts,
+                    layer_id=bundle.layer_id,
                 )
-            if self.wna16_backend != WNA16MoEBackend.TRITON:
+                operands = _private_wna16_dispatch_operands(generation_view)
+                is_capturing = getattr(torch.cuda, "is_current_stream_capturing", None)
+                if is_capturing is not None and is_capturing():
+                    raise Phase4UnsupportedError(
+                        Phase4FailureCategory.VALIDATION,
+                        "private WNA16 dispatch does not support CUDA graph capture",
+                    )
+            except BaseException:
+                with suppress(Phase4UnsupportedError):
+                    cancel_private_wna16_issued_request_use(generation_view)
+                raise
+            request_use_lease = acquire_private_wna16_request_use(generation_view)
+            if request_use_lease is None:
+                return self.moe_kernel.apply_private_wna16(
+                    x,
+                    operands.w13,
+                    operands.w2,
+                    operands.w13_scale,
+                    operands.w2_scale,
+                    operands.w13_zero,
+                    operands.w2_zero,
+                    topk_weights,
+                    topk_ids,
+                    activation=layer.activation,
+                    global_num_experts=layer.global_num_experts,
+                    slot_map=operands.slot_map,
+                    apply_router_weight_on_input=layer.apply_router_weight_on_input,
+                    shared_experts=shared_experts,
+                    shared_experts_input=shared_experts_input,
+                )
+
+            # Create the event before dispatch, then record it in the same stream
+            # immediately after (or while unwinding from) the private enqueue.
+            # A failure to establish the completion fence never releases storage.
+            try:
+                completion_event = torch.cuda.Event(enable_timing=False)
+            except Exception as error:
+                release_private_wna16_request_use_without_dispatch(request_use_lease)
                 raise Phase4UnsupportedError(
                     Phase4FailureCategory.UNSUPPORTED_DYNAMIC_MAP,
-                    "private WNA16 dispatch requires the Triton backend",
+                    "private WNA16 dispatch could not create a completion event",
+                ) from error
+            mark_private_wna16_request_dispatched(request_use_lease)
+            begin_private_wna16_request_enqueue(request_use_lease)
+            try:
+                return self.moe_kernel.apply_private_wna16(
+                    x,
+                    operands.w13,
+                    operands.w2,
+                    operands.w13_scale,
+                    operands.w2_scale,
+                    operands.w13_zero,
+                    operands.w2_zero,
+                    topk_weights,
+                    topk_ids,
+                    activation=layer.activation,
+                    global_num_experts=layer.global_num_experts,
+                    slot_map=operands.slot_map,
+                    apply_router_weight_on_input=layer.apply_router_weight_on_input,
+                    shared_experts=shared_experts,
+                    shared_experts_input=shared_experts_input,
                 )
-            if layer.use_ep:
-                raise Phase4UnsupportedError(
-                    Phase4FailureCategory.UNSUPPORTED_DYNAMIC_MAP,
-                    "private WNA16 dispatch does not support expert parallelism",
-                )
-            bundle = generation_view.bundle
-            if (
-                bundle.quant_type != f"W{self.num_bits}A16"
-                or bundle.num_bits != self.num_bits
-                or bundle.symmetric is not self.symmetric
-                or bundle.group_size != self.group_size
-                or bundle.group_size != 32
-                or self.actorder is not None
-                or bundle.act_order
-            ):
-                raise Phase4UnsupportedError(
-                    Phase4FailureCategory.VALIDATION,
-                    "private WNA16 bundle quantization does not match "
-                    "layer quantization",
-                )
-            validate_private_wna16_dispatch_inputs(
-                generation_view,
-                hidden_states=x,
-                topk_ids=topk_ids,
-                topk_weights=topk_weights,
-                global_num_experts=layer.global_num_experts,
-                layer_id=bundle.layer_id,
-            )
-            operands = _private_wna16_dispatch_operands(generation_view)
-            is_capturing = getattr(torch.cuda, "is_current_stream_capturing", None)
-            if is_capturing is not None and is_capturing():
-                raise Phase4UnsupportedError(
-                    Phase4FailureCategory.VALIDATION,
-                    "private WNA16 dispatch does not support CUDA graph capture",
-                )
-            return self.moe_kernel.apply_private_wna16(
-                x,
-                operands.w13,
-                operands.w2,
-                operands.w13_scale,
-                operands.w2_scale,
-                operands.w13_zero,
-                operands.w2_zero,
-                topk_weights,
-                topk_ids,
-                activation=layer.activation,
-                global_num_experts=layer.global_num_experts,
-                slot_map=operands.slot_map,
-                apply_router_weight_on_input=layer.apply_router_weight_on_input,
-                shared_experts=shared_experts,
-                shared_experts_input=shared_experts_input,
-            )
+            finally:
+                dispatch_exception = sys.exc_info()[0]
+                try:
+                    completion_event.record()
+                except Exception as error:
+                    quarantine_private_wna16_request_use_without_fence(
+                        request_use_lease
+                    )
+                    # A kernel error remains the primary exception. The dispatched
+                    # lease stays retained because no completion was established.
+                    if dispatch_exception is None:
+                        raise Phase4UnsupportedError(
+                            Phase4FailureCategory.UNSUPPORTED_DYNAMIC_MAP,
+                            "private WNA16 dispatch could not record "
+                            "a completion event",
+                        ) from error
+                else:
+                    try:
+                        release_private_wna16_request_use_pending(
+                            request_use_lease, completion_event
+                        )
+                    except Exception:
+                        # release_pending has already attached the event before it
+                        # can poll it during a concurrent shutdown.
+                        if dispatch_exception is None:
+                            raise
+        else:
+            assert not self.is_monolithic
+            assert self.moe_kernel is not None
         if transient_expert_map is not None:
             raise RuntimeError(
                 "WNA16 transient expert map requires a proven backend contract"

@@ -506,9 +506,7 @@ class Worker(WorkerBase):
             )
 
             controller = PrivateWNA16ResidencyController(layer_id)
-            registration = register_private_wna16_provider_factory(
-                controller.make_provider
-            )
+            registration = register_private_wna16_provider_factory(controller)
         try:
             with (
                 self._maybe_get_memory_pool_context(tag="weights"),

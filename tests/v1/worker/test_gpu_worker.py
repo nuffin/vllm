@@ -2,10 +2,14 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 
+from vllm.model_executor.layers.fused_moe.expert_residency import (
+    Phase4FailureCategory,
+    Phase4UnsupportedError,
+)
 from vllm.utils.mem_constants import GiB_bytes
 from vllm.v1.worker import gpu_worker, startup_plan
 from vllm.v1.worker.gpu_worker import maybe_rocm_profiling_fallback
@@ -143,6 +147,46 @@ def test_profiling_fallback_never_returns_a_negative_amount(rocm):
     )
 
     assert maybe_rocm_profiling_fallback(result) == 0
+
+
+def test_worker_shutdown_preserves_controller_until_verified_drain_retries():
+    """DRAIN_INCOMPLETE stops before model-runner storage teardown."""
+    worker = object.__new__(gpu_worker.Worker)
+    registration = MagicMock()
+    registration.close.side_effect = [
+        Phase4UnsupportedError(
+            Phase4FailureCategory.DRAIN_INCOMPLETE,
+            "CPU fake controller has not verified drain",
+        ),
+        None,
+    ]
+    controller = object()
+    model_runner = MagicMock()
+    worker._shutdown_complete = False
+    worker._private_wna16_provider_registration = registration
+    worker._private_wna16_residency_controller = controller
+    worker.model_runner = model_runner
+    worker.profiler = None
+    worker.weight_transfer_engine = None
+    worker.elastic_ep_executor = None
+
+    platform = SimpleNamespace(is_cuda_alike=lambda: False)
+    with patch.object(gpu_worker, "current_platform", platform):
+        with pytest.raises(Phase4UnsupportedError) as error:
+            worker.shutdown()
+        assert error.value.category is Phase4FailureCategory.DRAIN_INCOMPLETE
+        assert worker._private_wna16_provider_registration is registration
+        assert worker._private_wna16_residency_controller is controller
+        model_runner.shutdown.assert_not_called()
+        assert not worker._shutdown_complete
+
+        worker.shutdown()
+
+    assert registration.close.call_count == 2
+    assert worker._private_wna16_provider_registration is None
+    assert worker._private_wna16_residency_controller is None
+    model_runner.shutdown.assert_called_once_with()
+    assert worker._shutdown_complete
 
 
 @pytest.mark.parametrize("rocm", [False], indirect=True)

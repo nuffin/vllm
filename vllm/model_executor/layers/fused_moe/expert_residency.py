@@ -494,6 +494,8 @@ class Phase4FailureCategory(Enum):
     VALIDATION = "validation"
     TIMEOUT = "timeout"
     STALE_LEASE = "stale lease"
+    EVENT_QUERY = "event query"
+    DRAIN_INCOMPLETE = "drain incomplete"
     UNSUPPORTED_DYNAMIC_MAP = "unsupported dynamic map"
 
 
@@ -845,6 +847,11 @@ class WNA16GenerationView(_WeakrefableWNA16GenerationView):
     map_generation: int
     use_lease: WNA16UseLease
     _stable_slot_storage: _WNA16StableSlotStorage | None = field(
+        default=None, init=False, repr=False, compare=False
+    )
+    # Controller-owned, request-local use authority. This deliberately remains
+    # opaque here to preserve the public generation-view and WNA16UseLease ABI.
+    _request_use_lease: object | None = field(
         default=None, init=False, repr=False, compare=False
     )
 

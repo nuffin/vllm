@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+from threading import Event, Thread
 from types import SimpleNamespace
 from typing import cast
 from unittest.mock import MagicMock, patch
@@ -30,8 +31,14 @@ from vllm.model_executor.layers.fused_moe.modular_kernel import (
 )
 from vllm.model_executor.layers.fused_moe.oracle.int_wna16 import WNA16MoEBackend
 from vllm.model_executor.layers.fused_moe.private_wna16_provider import (
+    PrivateWNA16ResidencyController,
+    _WNA16RequestUseState,
+    acquire_private_wna16_request_use,
+    begin_private_wna16_request_enqueue,
     bind_private_wna16_generation_view_provider,
+    mark_private_wna16_request_dispatched,
     register_private_wna16_provider_factory,
+    release_private_wna16_request_use_pending,
 )
 from vllm.model_executor.layers.fused_moe.routed_experts import RoutedExperts
 from vllm.model_executor.layers.fused_moe.runner.moe_runner import MoERunner
@@ -105,6 +112,87 @@ def unbound_private_view() -> WNA16GenerationView:
     view = private_view()
     object.__setattr__(view, "_stable_slot_storage", None)
     return view
+
+
+def _request_use_dispatch_target(
+    kernel: MagicMock, factory: Callable | None = None
+):
+    adapter = Phase4GpuResidencyAdapter(
+        enabled=True,
+        model_family="Qwen3-30B-A3B",
+        quantization="WNA16",
+        backend_supports_dynamic_map=True,
+        private_dispatch_enabled=True,
+        private_dispatch_layer_id=3,
+    )
+    routed_experts = mocked_routed_experts(adapter)
+    if factory is None:
+        factory = cast(Callable, lambda _: lambda **_: unbound_private_view())
+    registration = register_private_wna16_provider_factory(factory)
+    bind_private_wna16_generation_view_provider(
+        layer_id=3, routed_experts=routed_experts
+    )
+    view = routed_experts.get_private_wna16_generation_view(
+        topk_ids=torch.tensor([[3, 1]], dtype=torch.int32),
+        topk_weights=torch.tensor([[0.25, 0.75]]),
+    )
+    assert view is not None
+    method = SimpleNamespace(
+        is_monolithic=False,
+        moe_kernel=kernel,
+        wna16_backend=WNA16MoEBackend.TRITON,
+        num_bits=4,
+        symmetric=True,
+        group_size=32,
+        actorder=None,
+    )
+    layer = SimpleNamespace(
+        use_ep=False,
+        activation=MagicMock(),
+        global_num_experts=4,
+        apply_router_weight_on_input=False,
+    )
+    return registration, view, method, layer
+
+
+class _VerifiedShutdownDrainFactory:
+    """CPU-only registered controller double with exact-lease verification."""
+
+    def __init__(self) -> None:
+        self.expected_lease: object | None = None
+        self.verifier_calls: list[object] = []
+
+    def __call__(self, _):
+        return lambda **_: unbound_private_view()
+
+    def verify_shutdown_drain(self, lease) -> bool:
+        self.verifier_calls.append(lease)
+        return lease is self.expected_lease
+
+
+def _quarantine_request_use(registration, view):
+    lease = acquire_private_wna16_request_use(view)
+    assert lease is not None
+    mark_private_wna16_request_dispatched(lease)
+    begin_private_wna16_request_enqueue(lease)
+    lease.manager.quarantine_unfenced(lease)
+    with pytest.raises(Phase4UnsupportedError) as error:
+        registration.close()
+    assert error.value.category is Phase4FailureCategory.DRAIN_INCOMPLETE
+    return lease
+
+
+def _apply_private_request_use(method, layer, view) -> object:
+    return CompressedTensorsWNA16MoEMethod.apply(
+        method,
+        layer=layer,
+        x=torch.ones(1, 2),
+        topk_weights=torch.ones(1, 2),
+        topk_ids=torch.tensor([[3, 1]], dtype=torch.int32),
+        shared_experts=None,
+        shared_experts_input=None,
+        generation_view=view,
+    )
 
 
 def test_default_off_is_explicit_and_fail_closed():
@@ -946,6 +1034,1014 @@ def test_registration_close_revokes_an_already_bound_provider():
 
     assert error.value.category is Phase4FailureCategory.STALE_LEASE
     assert calls == [True]
+
+
+def test_private_request_use_event_defers_final_release_without_cuda():
+    """The preparatory hook is testable with a CPU fake event, not CUDA work."""
+    adapter = Phase4GpuResidencyAdapter(
+        enabled=True,
+        model_family="Qwen3-30B-A3B",
+        quantization="WNA16",
+        backend_supports_dynamic_map=True,
+        private_dispatch_enabled=True,
+        private_dispatch_layer_id=3,
+    )
+    routed_experts = mocked_routed_experts(adapter)
+    registration = register_private_wna16_provider_factory(
+        cast(Callable, lambda _: lambda **_: unbound_private_view())
+    )
+    try:
+        bind_private_wna16_generation_view_provider(
+            layer_id=3, routed_experts=routed_experts
+        )
+        view = routed_experts.get_private_wna16_generation_view(
+            topk_ids=torch.tensor([[3, 1]], dtype=torch.int32),
+            topk_weights=torch.tensor([[0.25, 0.75]]),
+        )
+        assert view is not None
+        calls: list[str] = []
+
+        class FakeEvent:
+            complete = False
+
+            def __init__(self, *, enable_timing: bool) -> None:
+                assert enable_timing is False
+                calls.append("event-create")
+
+            def record(self) -> None:
+                calls.append("event-record")
+
+            def query(self) -> bool:
+                calls.append("event-query")
+                return self.complete
+
+        kernel = MagicMock()
+
+        def dispatch(*_, **__) -> None:
+            calls.append("kernel")
+            registration.close()
+
+        kernel.apply_private_wna16.side_effect = dispatch
+        method = SimpleNamespace(
+            is_monolithic=False,
+            moe_kernel=kernel,
+            wna16_backend=WNA16MoEBackend.TRITON,
+            num_bits=4,
+            symmetric=True,
+            group_size=32,
+            actorder=None,
+        )
+        layer = SimpleNamespace(
+            use_ep=False,
+            activation=MagicMock(),
+            global_num_experts=4,
+            apply_router_weight_on_input=False,
+        )
+        with (
+            patch(
+                "vllm.model_executor.layers.quantization.compressed_tensors."
+                "compressed_tensors_moe.compressed_tensors_moe_wna16."
+                "validate_private_wna16_dispatch_inputs"
+            ),
+            patch("torch.cuda.is_current_stream_capturing", return_value=False),
+            patch("torch.cuda.Event", FakeEvent),
+            pytest.raises(Phase4UnsupportedError) as error,
+        ):
+            CompressedTensorsWNA16MoEMethod.apply(
+                method,
+                layer=layer,
+                x=torch.ones(1, 2),
+                topk_weights=torch.ones(1, 2),
+                topk_ids=torch.tensor([[3, 1]], dtype=torch.int32),
+                shared_experts=None,
+                shared_experts_input=None,
+                generation_view=view,
+            )
+
+        request_use_lease = object.__getattribute__(view, "_request_use_lease")
+        assert error.value.category is Phase4FailureCategory.DRAIN_INCOMPLETE
+        assert calls == ["event-create", "kernel", "event-record", "event-query"]
+        assert request_use_lease.state is _WNA16RequestUseState.FENCED_PENDING
+        assert len(request_use_lease.manager._by_id) == 1
+        with pytest.raises(Phase4UnsupportedError) as error:
+            acquire_private_wna16_request_use(view)
+        assert error.value.category is Phase4FailureCategory.STALE_LEASE
+        request_use_lease.manager.finalize_completed()
+        assert request_use_lease.state is _WNA16RequestUseState.FENCED_PENDING
+        request_use_lease.completion_event.complete = True
+        request_use_lease.manager.finalize_completed()
+        assert request_use_lease.state is _WNA16RequestUseState.RELEASED
+        assert len(request_use_lease.manager._by_id) == 0
+        assert calls[-3:] == ["event-query", "event-query", "event-query"]
+    finally:
+        registration.close()
+
+
+def test_close_retries_completed_event_attachment_after_non_drained_failure():
+    """A close cannot succeed before an in-flight dispatch records its fence."""
+    adapter = Phase4GpuResidencyAdapter(
+        enabled=True,
+        model_family="Qwen3-30B-A3B",
+        quantization="WNA16",
+        backend_supports_dynamic_map=True,
+        private_dispatch_enabled=True,
+        private_dispatch_layer_id=3,
+    )
+    routed_experts = mocked_routed_experts(adapter)
+    registration = register_private_wna16_provider_factory(
+        cast(Callable, lambda _: lambda **_: unbound_private_view())
+    )
+    try:
+        bind_private_wna16_generation_view_provider(
+            layer_id=3, routed_experts=routed_experts
+        )
+        view = routed_experts.get_private_wna16_generation_view(
+            topk_ids=torch.tensor([[3, 1]], dtype=torch.int32),
+            topk_weights=torch.tensor([[0.25, 0.75]]),
+        )
+        assert view is not None
+        lease = acquire_private_wna16_request_use(view)
+        assert lease is not None
+        mark_private_wna16_request_dispatched(lease)
+        begin_private_wna16_request_enqueue(lease)
+
+        class CompleteEvent:
+            def query(self) -> bool:
+                return True
+
+        with pytest.raises(Phase4UnsupportedError) as error:
+            registration.close()
+        assert error.value.category is Phase4FailureCategory.DRAIN_INCOMPLETE
+        assert lease.state is _WNA16RequestUseState.ENQUEUING
+        assert lease.manager._by_id[id(lease)] is lease
+        release_private_wna16_request_use_pending(lease, CompleteEvent())
+
+        assert lease.state is _WNA16RequestUseState.RELEASED
+        assert len(lease.manager._by_id) == 0
+        registration.close()
+    finally:
+        registration.close()
+
+
+@pytest.mark.parametrize("result", [1, 0, "complete", None])
+def test_completion_event_query_requires_exact_bool_and_retains_lease(result):
+    registration, view, _, _ = _request_use_dispatch_target(MagicMock())
+    try:
+        lease = acquire_private_wna16_request_use(view)
+        assert lease is not None
+        mark_private_wna16_request_dispatched(lease)
+        begin_private_wna16_request_enqueue(lease)
+
+        class InvalidResultEvent:
+            def query(self):
+                return result
+
+        event = InvalidResultEvent()
+        release_private_wna16_request_use_pending(lease, event)
+        with pytest.raises(Phase4UnsupportedError) as error:
+            lease.manager.finalize_completed()
+        assert error.value.category is Phase4FailureCategory.EVENT_QUERY
+        assert lease.state is _WNA16RequestUseState.FENCED_PENDING
+        assert lease.completion_event is event
+        assert lease.manager._by_id[id(lease)] is lease
+        with pytest.raises(Phase4UnsupportedError) as stale:
+            acquire_private_wna16_request_use(view)
+        assert stale.value.category is Phase4FailureCategory.STALE_LEASE
+        lease.completion_event = SimpleNamespace(query=lambda: True)
+    finally:
+        registration.close()
+
+
+def test_completion_event_missing_query_and_exception_retain_lease():
+    registration, view, _, _ = _request_use_dispatch_target(MagicMock())
+    try:
+        lease = acquire_private_wna16_request_use(view)
+        assert lease is not None
+        mark_private_wna16_request_dispatched(lease)
+        begin_private_wna16_request_enqueue(lease)
+        event = object()
+        release_private_wna16_request_use_pending(lease, event)
+        with pytest.raises(Phase4UnsupportedError) as error:
+            lease.manager.finalize_completed()
+        assert error.value.category is Phase4FailureCategory.EVENT_QUERY
+        assert lease.state is _WNA16RequestUseState.FENCED_PENDING
+        assert lease.completion_event is event
+
+        class RaisingEvent:
+            def query(self) -> bool:
+                raise RuntimeError("query failed")
+
+        raising_event = RaisingEvent()
+        lease.completion_event = raising_event
+        with pytest.raises(Phase4UnsupportedError) as error:
+            lease.manager.finalize_completed()
+        assert error.value.category is Phase4FailureCategory.EVENT_QUERY
+        assert isinstance(error.value.__cause__, RuntimeError)
+        assert lease.state is _WNA16RequestUseState.FENCED_PENDING
+        assert lease.completion_event is raising_event
+        assert lease.manager._by_id[id(lease)] is lease
+        lease.completion_event = SimpleNamespace(query=lambda: True)
+    finally:
+        registration.close()
+
+
+def test_finalize_completed_queries_later_leases_after_event_query_error():
+    registration, first_view, _, _ = _request_use_dispatch_target(MagicMock())
+    try:
+        second_view = registration._registration.request_use_manager.bind(
+            unbound_private_view()
+        )
+        first_lease = acquire_private_wna16_request_use(first_view)
+        second_lease = acquire_private_wna16_request_use(second_view)
+        assert first_lease is not None
+        assert second_lease is not None
+        mark_private_wna16_request_dispatched(first_lease)
+        begin_private_wna16_request_enqueue(first_lease)
+        mark_private_wna16_request_dispatched(second_lease)
+        begin_private_wna16_request_enqueue(second_lease)
+        calls: list[str] = []
+
+        class RaisingEvent:
+            def query(self) -> bool:
+                calls.append("first")
+                raise RuntimeError("query failed")
+
+        class CompleteEvent:
+            def query(self) -> bool:
+                calls.append("second")
+                return True
+
+        failing_event = RaisingEvent()
+        release_private_wna16_request_use_pending(first_lease, failing_event)
+        release_private_wna16_request_use_pending(second_lease, CompleteEvent())
+
+        with pytest.raises(Phase4UnsupportedError) as error:
+            first_lease.manager.finalize_completed()
+        assert error.value.category is Phase4FailureCategory.EVENT_QUERY
+        assert isinstance(error.value.__cause__, RuntimeError)
+        assert calls == ["first", "second"]
+        assert first_lease.state is _WNA16RequestUseState.FENCED_PENDING
+        assert first_lease.completion_event is failing_event
+        assert first_lease.manager._by_id[id(first_lease)] is first_lease
+        assert not first_lease.query_in_progress
+        assert second_lease.state is _WNA16RequestUseState.RELEASED
+        assert id(second_lease) not in second_lease.manager._by_id
+        first_lease.completion_event = SimpleNamespace(query=lambda: True)
+    finally:
+        registration.close()
+
+
+def test_closed_registration_retries_pending_event_query_without_reopening_admission():
+    calls = MagicMock()
+    registration = register_private_wna16_provider_factory(
+        cast(Callable, lambda _: calls)
+    )
+    adapter = Phase4GpuResidencyAdapter(
+        enabled=True,
+        model_family="Qwen3-30B-A3B",
+        quantization="WNA16",
+        backend_supports_dynamic_map=True,
+        private_dispatch_enabled=True,
+        private_dispatch_layer_id=3,
+    )
+    routed_experts = mocked_routed_experts(adapter)
+    try:
+        calls.return_value = unbound_private_view()
+        bind_private_wna16_generation_view_provider(
+            layer_id=3, routed_experts=routed_experts
+        )
+        view = routed_experts.get_private_wna16_generation_view(
+            topk_ids=torch.tensor([[3, 1]], dtype=torch.int32),
+            topk_weights=torch.tensor([[0.25, 0.75]]),
+        )
+        assert view is not None
+        lease = acquire_private_wna16_request_use(view)
+        assert lease is not None
+        mark_private_wna16_request_dispatched(lease)
+        begin_private_wna16_request_enqueue(lease)
+
+        class RetryableEvent:
+            complete = False
+
+            def query(self) -> bool:
+                if not self.complete:
+                    raise RuntimeError("query failed")
+                return True
+
+        event = RetryableEvent()
+        release_private_wna16_request_use_pending(lease, event)
+        with pytest.raises(Phase4UnsupportedError) as error:
+            registration.close()
+        assert error.value.category is Phase4FailureCategory.EVENT_QUERY
+        assert lease.state is _WNA16RequestUseState.FENCED_PENDING
+        assert lease.completion_event is event
+        with pytest.raises(Phase4UnsupportedError) as stale:
+            routed_experts.get_private_wna16_generation_view(
+                topk_ids=torch.tensor([[3, 1]], dtype=torch.int32),
+                topk_weights=torch.tensor([[0.25, 0.75]]),
+            )
+        assert stale.value.category is Phase4FailureCategory.STALE_LEASE
+        assert calls.call_count == 1
+
+        event.complete = True
+        registration.close()
+        assert lease.state is _WNA16RequestUseState.RELEASED
+        assert id(lease) not in lease.manager._by_id
+        assert calls.call_count == 1
+    finally:
+        registration.close()
+
+
+def test_provider_admission_query_error_does_not_call_provider():
+    calls = MagicMock()
+    registration = register_private_wna16_provider_factory(
+        cast(Callable, lambda _: calls)
+    )
+    adapter = Phase4GpuResidencyAdapter(
+        enabled=True,
+        model_family="Qwen3-30B-A3B",
+        quantization="WNA16",
+        backend_supports_dynamic_map=True,
+        private_dispatch_enabled=True,
+        private_dispatch_layer_id=3,
+    )
+    routed_experts = mocked_routed_experts(adapter)
+    try:
+        calls.return_value = unbound_private_view()
+        bind_private_wna16_generation_view_provider(
+            layer_id=3, routed_experts=routed_experts
+        )
+        view = routed_experts.get_private_wna16_generation_view(
+            topk_ids=torch.tensor([[3, 1]], dtype=torch.int32),
+            topk_weights=torch.tensor([[0.25, 0.75]]),
+        )
+        assert view is not None
+        lease = acquire_private_wna16_request_use(view)
+        assert lease is not None
+        mark_private_wna16_request_dispatched(lease)
+        begin_private_wna16_request_enqueue(lease)
+
+        class RaisingEvent:
+            def query(self) -> bool:
+                raise RuntimeError("query failed")
+
+        event = RaisingEvent()
+        release_private_wna16_request_use_pending(lease, event)
+        with pytest.raises(Phase4UnsupportedError) as error:
+            routed_experts.get_private_wna16_generation_view(
+                topk_ids=torch.tensor([[3, 1]], dtype=torch.int32),
+                topk_weights=torch.tensor([[0.25, 0.75]]),
+            )
+        assert error.value.category is Phase4FailureCategory.EVENT_QUERY
+        assert calls.call_count == 1
+        assert lease.state is _WNA16RequestUseState.FENCED_PENDING
+        assert lease.completion_event is event
+        lease.completion_event = SimpleNamespace(query=lambda: True)
+    finally:
+        registration.close()
+
+
+def test_closed_manager_release_pending_query_error_is_not_record_error():
+    registration, view, _, _ = _request_use_dispatch_target(MagicMock())
+    try:
+        lease = acquire_private_wna16_request_use(view)
+        assert lease is not None
+        mark_private_wna16_request_dispatched(lease)
+        begin_private_wna16_request_enqueue(lease)
+
+        class RaisingEvent:
+            def query(self) -> bool:
+                raise RuntimeError("query failed")
+
+        event = RaisingEvent()
+        with pytest.raises(Phase4UnsupportedError) as drain_error:
+            registration.close()
+        assert drain_error.value.category is Phase4FailureCategory.DRAIN_INCOMPLETE
+        with pytest.raises(Phase4UnsupportedError) as error:
+            release_private_wna16_request_use_pending(lease, event)
+        assert error.value.category is Phase4FailureCategory.EVENT_QUERY
+        assert isinstance(error.value.__cause__, RuntimeError)
+        assert lease.state is _WNA16RequestUseState.FENCED_PENDING
+        assert lease.completion_event is event
+        assert lease.manager._by_id[id(lease)] is lease
+        lease.completion_event = SimpleNamespace(query=lambda: True)
+    finally:
+        registration.close()
+
+
+def test_close_failure_remains_primary_over_recorded_event_query_error():
+    calls: list[str] = []
+
+    class RaisingQueryEvent:
+        def __init__(self, *, enable_timing: bool) -> None:
+            assert enable_timing is False
+            calls.append("event-create")
+
+        def record(self) -> None:
+            calls.append("event-record")
+
+        def query(self) -> bool:
+            calls.append("event-query")
+            raise RuntimeError("query failed")
+
+    kernel = MagicMock()
+    registration, view, method, layer = _request_use_dispatch_target(kernel)
+    def close_registration(*_args, **_kwargs):
+        registration.close()
+
+    kernel.apply_private_wna16.side_effect = close_registration
+    try:
+        with (
+            patch(
+                "vllm.model_executor.layers.quantization.compressed_tensors."
+                "compressed_tensors_moe.compressed_tensors_moe_wna16."
+                "validate_private_wna16_dispatch_inputs"
+            ),
+            patch("torch.cuda.is_current_stream_capturing", return_value=False),
+            patch("torch.cuda.Event", RaisingQueryEvent),
+            pytest.raises(Phase4UnsupportedError) as error,
+        ):
+            _apply_private_request_use(method, layer, view)
+
+        lease = object.__getattribute__(view, "_request_use_lease")
+        assert error.value.category is Phase4FailureCategory.DRAIN_INCOMPLETE
+        assert calls == ["event-create", "event-record", "event-query"]
+        assert lease.state is _WNA16RequestUseState.FENCED_PENDING
+        assert lease.completion_event is not None
+        assert lease.manager._by_id[id(lease)] is lease
+        kernel.apply_private_wna16.assert_called_once()
+        kernel.apply.assert_not_called()
+        lease.completion_event = SimpleNamespace(query=lambda: True)
+    finally:
+        registration.close()
+
+
+def test_kernel_error_remains_primary_when_closed_event_query_fails():
+    class KernelFailure(Exception):
+        pass
+
+    calls: list[str] = []
+
+    class RaisingQueryEvent:
+        should_complete = False
+
+        def __init__(self, *, enable_timing: bool) -> None:
+            assert enable_timing is False
+            calls.append("event-create")
+
+        def record(self) -> None:
+            calls.append("event-record")
+
+        def query(self) -> bool:
+            calls.append("event-query")
+            if self.should_complete:
+                return True
+            raise RuntimeError("query failed")
+
+    kernel = MagicMock()
+    registration, view, method, layer = _request_use_dispatch_target(kernel)
+
+    def close_then_fail(*_args, **_kwargs) -> None:
+        with pytest.raises(Phase4UnsupportedError) as drain_error:
+            registration.close()
+        assert drain_error.value.category is Phase4FailureCategory.DRAIN_INCOMPLETE
+        raise KernelFailure("kernel failed")
+
+    kernel.apply_private_wna16.side_effect = close_then_fail
+    try:
+        with (
+            patch(
+                "vllm.model_executor.layers.quantization.compressed_tensors."
+                "compressed_tensors_moe.compressed_tensors_moe_wna16."
+                "validate_private_wna16_dispatch_inputs"
+            ),
+            patch("torch.cuda.is_current_stream_capturing", return_value=False),
+            patch("torch.cuda.Event", RaisingQueryEvent),
+            pytest.raises(KernelFailure, match="kernel failed"),
+        ):
+            _apply_private_request_use(method, layer, view)
+
+        lease = object.__getattribute__(view, "_request_use_lease")
+        assert calls == ["event-create", "event-record", "event-query"]
+        assert lease.state is _WNA16RequestUseState.FENCED_PENDING
+        assert lease.manager._by_id[id(lease)] is lease
+        lease.completion_event.should_complete = True
+        lease.manager.finalize_completed()
+        assert lease.state is _WNA16RequestUseState.RELEASED
+        assert id(lease) not in lease.manager._by_id
+    finally:
+        registration.close()
+
+
+def test_finalize_completed_avoids_duplicate_query_in_progress():
+    registration, view, _, _ = _request_use_dispatch_target(MagicMock())
+    query_entered = Event()
+    allow_query_return = Event()
+    try:
+        lease = acquire_private_wna16_request_use(view)
+        assert lease is not None
+        mark_private_wna16_request_dispatched(lease)
+        begin_private_wna16_request_enqueue(lease)
+
+        class BlockingEvent:
+            calls = 0
+            complete = False
+
+            def query(self) -> bool:
+                self.calls += 1
+                query_entered.set()
+                assert allow_query_return.wait(timeout=5)
+                return self.complete
+
+        event = BlockingEvent()
+        release_private_wna16_request_use_pending(lease, event)
+        query_thread = Thread(target=lease.manager.finalize_completed)
+        query_thread.start()
+        assert query_entered.wait(timeout=5)
+        lease.manager.finalize_completed()
+        assert event.calls == 1
+        allow_query_return.set()
+        query_thread.join(timeout=5)
+        assert not query_thread.is_alive()
+        assert lease.state is _WNA16RequestUseState.FENCED_PENDING
+        assert not lease.query_in_progress
+        event.complete = True
+        lease.manager.finalize_completed()
+        assert lease.state is _WNA16RequestUseState.RELEASED
+        assert id(lease) not in lease.manager._by_id
+    finally:
+        allow_query_return.set()
+        registration.close()
+
+
+def test_completion_event_query_runs_outside_manager_lock():
+    registration, view, _, _ = _request_use_dispatch_target(MagicMock())
+    try:
+        lease = acquire_private_wna16_request_use(view)
+        assert lease is not None
+        mark_private_wna16_request_dispatched(lease)
+        begin_private_wna16_request_enqueue(lease)
+
+        class LockCheckingEvent:
+            def query(self) -> bool:
+                acquired: list[bool] = []
+
+                def acquire_manager_lock() -> None:
+                    acquired_lock = lease.manager._lock.acquire(blocking=False)
+                    acquired.append(acquired_lock)
+                    if acquired_lock:
+                        lease.manager._lock.release()
+
+                lock_thread = Thread(target=acquire_manager_lock)
+                lock_thread.start()
+                lock_thread.join(timeout=5)
+                assert not lock_thread.is_alive()
+                assert acquired == [True]
+                return True
+
+        release_private_wna16_request_use_pending(lease, LockCheckingEvent())
+        lease.manager.finalize_completed()
+        assert lease.state is _WNA16RequestUseState.RELEASED
+        assert id(lease) not in lease.manager._by_id
+    finally:
+        registration.close()
+
+
+def test_shutdown_wins_pre_enqueue_releases_lease_and_never_calls_kernel():
+    """A marked-but-not-admitted use is revocable without a completion proof."""
+    kernel = MagicMock()
+    registration, view, method, layer = _request_use_dispatch_target(kernel)
+    marked = Event()
+    resume = Event()
+    outcome: list[BaseException] = []
+    original_mark = mark_private_wna16_request_dispatched
+
+    def mark_and_pause(lease) -> None:
+        original_mark(lease)
+        marked.set()
+        assert resume.wait(timeout=5)
+
+    def apply_in_thread() -> None:
+        try:
+            _apply_private_request_use(method, layer, view)
+        except BaseException as error:
+            outcome.append(error)
+
+    try:
+        with (
+            patch(
+                "vllm.model_executor.layers.quantization.compressed_tensors."
+                "compressed_tensors_moe.compressed_tensors_moe_wna16."
+                "validate_private_wna16_dispatch_inputs"
+            ),
+            patch("torch.cuda.is_current_stream_capturing", return_value=False),
+            patch("torch.cuda.Event", MagicMock()),
+            patch(
+                "vllm.model_executor.layers.quantization.compressed_tensors."
+                "compressed_tensors_moe.compressed_tensors_moe_wna16."
+                "mark_private_wna16_request_dispatched",
+                side_effect=mark_and_pause,
+            ),
+        ):
+            thread = Thread(target=apply_in_thread)
+            thread.start()
+            assert marked.wait(timeout=5)
+            lease = object.__getattribute__(view, "_request_use_lease")
+            assert lease.state is _WNA16RequestUseState.PRE_ENQUEUE
+            registration.close()
+            assert lease.state is _WNA16RequestUseState.RELEASED
+            assert id(lease) not in lease.manager._by_id
+            kernel.apply_private_wna16.assert_not_called()
+            resume.set()
+            thread.join(timeout=5)
+            assert not thread.is_alive()
+        assert len(outcome) == 1
+        assert isinstance(outcome[0], Phase4UnsupportedError)
+        assert outcome[0].category is Phase4FailureCategory.STALE_LEASE
+        kernel.apply_private_wna16.assert_not_called()
+    finally:
+        resume.set()
+
+
+def test_enqueue_wins_pre_enqueue_race_retains_lease_until_fence_completes():
+    """Once enqueue admission owns the lock, close must retain the live use."""
+    kernel = MagicMock()
+    registration, view, method, layer = _request_use_dispatch_target(kernel)
+    admitted = Event()
+    resume = Event()
+    outcome: list[BaseException] = []
+    original_begin = begin_private_wna16_request_enqueue
+
+    class PendingEvent:
+        complete = False
+
+        def __init__(self, *, enable_timing: bool) -> None:
+            assert enable_timing is False
+
+        def record(self) -> None:
+            pass
+
+        def query(self) -> bool:
+            return self.complete
+
+    def begin_and_pause(lease) -> None:
+        original_begin(lease)
+        admitted.set()
+        assert resume.wait(timeout=5)
+
+    def apply_in_thread() -> None:
+        try:
+            _apply_private_request_use(method, layer, view)
+        except BaseException as error:
+            outcome.append(error)
+
+    try:
+        with (
+            patch(
+                "vllm.model_executor.layers.quantization.compressed_tensors."
+                "compressed_tensors_moe.compressed_tensors_moe_wna16."
+                "validate_private_wna16_dispatch_inputs"
+            ),
+            patch("torch.cuda.is_current_stream_capturing", return_value=False),
+            patch("torch.cuda.Event", PendingEvent),
+            patch(
+                "vllm.model_executor.layers.quantization.compressed_tensors."
+                "compressed_tensors_moe.compressed_tensors_moe_wna16."
+                "begin_private_wna16_request_enqueue",
+                side_effect=begin_and_pause,
+            ),
+        ):
+            thread = Thread(target=apply_in_thread)
+            thread.start()
+            assert admitted.wait(timeout=5)
+            lease = object.__getattribute__(view, "_request_use_lease")
+            assert lease.state is _WNA16RequestUseState.ENQUEUING
+            with pytest.raises(Phase4UnsupportedError) as error:
+                registration.close()
+            assert error.value.category is Phase4FailureCategory.DRAIN_INCOMPLETE
+            assert lease.manager._by_id[id(lease)] is lease
+            resume.set()
+            thread.join(timeout=5)
+            assert not thread.is_alive()
+            assert not outcome
+            kernel.apply_private_wna16.assert_called_once()
+            assert lease.state is _WNA16RequestUseState.FENCED_PENDING
+            with pytest.raises(Phase4UnsupportedError) as error:
+                registration.close()
+            assert error.value.category is Phase4FailureCategory.DRAIN_INCOMPLETE
+            lease.completion_event.complete = True
+            registration.close()
+            assert lease.state is _WNA16RequestUseState.RELEASED
+            assert id(lease) not in lease.manager._by_id
+    finally:
+        resume.set()
+        registration.close()
+
+
+def test_verified_shutdown_drain_proof_rejects_wrong_lease_and_replay():
+    """A shutdown-only proof is exact, one-shot, and cannot release a fence."""
+    factory = _VerifiedShutdownDrainFactory()
+    first = register_private_wna16_provider_factory(cast(Callable, factory))
+    first_view = first._registration.request_use_manager.bind(unbound_private_view())
+    first_lease = None
+    try:
+        first_lease = acquire_private_wna16_request_use(first_view)
+        assert first_lease is not None
+        mark_private_wna16_request_dispatched(first_lease)
+        begin_private_wna16_request_enqueue(first_lease)
+        first_lease.manager.quarantine_unfenced(first_lease)
+        second_view = first._registration.request_use_manager.bind(
+            unbound_private_view()
+        )
+        second_lease = acquire_private_wna16_request_use(second_view)
+        assert second_lease is not None
+        mark_private_wna16_request_dispatched(second_lease)
+        begin_private_wna16_request_enqueue(second_lease)
+        second_lease.manager.quarantine_unfenced(second_lease)
+        with pytest.raises(Phase4UnsupportedError) as error:
+            first.close()
+        assert error.value.category is Phase4FailureCategory.DRAIN_INCOMPLETE
+
+        factory.expected_lease = first_lease
+        first_proof = first.issue_verified_shutdown_drain_proof(first_lease)
+        with pytest.raises(Phase4UnsupportedError) as error:
+            first.release_verified_drain(second_lease, first_proof)
+        assert error.value.category is Phase4FailureCategory.STALE_LEASE
+        assert second_lease.state is _WNA16RequestUseState.UNFENCED_QUARANTINED
+
+        first.release_verified_drain(first_lease, first_proof)
+        with pytest.raises(Phase4UnsupportedError) as error:
+            first.release_verified_drain(first_lease, first_proof)
+        assert error.value.category is Phase4FailureCategory.STALE_LEASE
+        factory.expected_lease = second_lease
+        second_proof = first.issue_verified_shutdown_drain_proof(second_lease)
+        first.release_verified_drain(second_lease, second_proof)
+        first.close()
+    finally:
+        if first_lease is not None and first_lease.manager._by_id:
+            remaining = next(iter(first_lease.manager._by_id.values()))
+            factory.expected_lease = remaining
+            proof = first.issue_verified_shutdown_drain_proof(remaining)
+            first.release_verified_drain(remaining, proof)
+        first.close()
+
+
+def test_legacy_factory_cannot_supply_an_arbitrary_drain_callback():
+    """A registration stores no verifier for legacy callable factories."""
+    registration, view, _, _ = _request_use_dispatch_target(MagicMock())
+    lease = _quarantine_request_use(registration, view)
+    try:
+        with pytest.raises(TypeError):
+            cast(Callable, registration.issue_verified_shutdown_drain_proof)(
+                lease, lambda _: True
+            )
+        with pytest.raises(Phase4UnsupportedError) as error:
+            registration.issue_verified_shutdown_drain_proof(lease)
+        assert error.value.category is Phase4FailureCategory.DRAIN_INCOMPLETE
+        assert lease.manager._by_id[id(lease)] is lease
+    finally:
+        # Test-only teardown: legacy factories cannot produce a valid proof, so
+        # remove the intentionally retained lease before closing the registry.
+        if lease.manager._by_id:
+            lease.manager._release(lease)
+        registration.close()
+
+
+def test_shutdown_drain_blocks_re_registration_until_old_storage_releases():
+    """A failed close keeps the revoked registration active until it drains."""
+    first_factory = _VerifiedShutdownDrainFactory()
+    first = register_private_wna16_provider_factory(cast(Callable, first_factory))
+    first_view = first._registration.request_use_manager.bind(unbound_private_view())
+    lease = _quarantine_request_use(first, first_view)
+    try:
+        second_factory = _VerifiedShutdownDrainFactory()
+        with pytest.raises(Phase4UnsupportedError) as error:
+            register_private_wna16_provider_factory(cast(Callable, second_factory))
+        assert error.value.category is Phase4FailureCategory.UNSUPPORTED_DYNAMIC_MAP
+
+        first_factory.expected_lease = lease
+        proof = first.issue_verified_shutdown_drain_proof(lease)
+        first.release_verified_drain(lease, proof)
+        first.close()
+        second = register_private_wna16_provider_factory(cast(Callable, second_factory))
+        second.close()
+    finally:
+        first.close()
+
+
+def test_placeholder_controller_cannot_issue_verified_shutdown_drain_proof():
+    """The bootstrap placeholder has no verified drain backend."""
+    controller = PrivateWNA16ResidencyController(layer_id=3)
+    registration = register_private_wna16_provider_factory(controller)
+    view = registration._registration.request_use_manager.bind(unbound_private_view())
+    lease = _quarantine_request_use(registration, view)
+    with pytest.raises(Phase4UnsupportedError) as error:
+        registration.issue_verified_shutdown_drain_proof(lease)
+    assert error.value.category is Phase4FailureCategory.DRAIN_INCOMPLETE
+    assert lease.manager._by_id[id(lease)] is lease
+    # Test-only teardown: this placeholder deliberately cannot prove drain.
+    lease.manager._release(lease)
+    registration.close()
+
+
+def test_completion_event_create_failure_releases_acquired_request_use():
+    kernel = MagicMock()
+    registration, view, method, layer = _request_use_dispatch_target(kernel)
+    try:
+        with (
+            patch(
+                "vllm.model_executor.layers.quantization.compressed_tensors."
+                "compressed_tensors_moe.compressed_tensors_moe_wna16."
+                "validate_private_wna16_dispatch_inputs"
+            ),
+            patch("torch.cuda.is_current_stream_capturing", return_value=False),
+            patch("torch.cuda.Event", side_effect=RuntimeError("create failed")),
+            pytest.raises(Phase4UnsupportedError, match="create a completion"),
+        ):
+            _apply_private_request_use(method, layer, view)
+
+        lease = object.__getattribute__(view, "_request_use_lease")
+        assert lease.state is _WNA16RequestUseState.RELEASED
+        assert len(lease.manager._by_id) == 0
+        kernel.apply_private_wna16.assert_not_called()
+    finally:
+        registration.close()
+
+
+def test_apply_monolithic_assertion_cancels_issued_request_use():
+    kernel = MagicMock()
+    registration, view, method, layer = _request_use_dispatch_target(kernel)
+    try:
+        method.is_monolithic = True
+        with pytest.raises(AssertionError):
+            _apply_private_request_use(method, layer, view)
+
+        lease = object.__getattribute__(view, "_request_use_lease")
+        assert lease.state is _WNA16RequestUseState.RELEASED
+        assert len(lease.manager._by_id) == 0
+        kernel.apply_private_wna16.assert_not_called()
+        kernel.apply.assert_not_called()
+    finally:
+        registration.close()
+
+
+def test_apply_missing_kernel_assertion_cancels_issued_request_use():
+    kernel = MagicMock()
+    registration, view, method, layer = _request_use_dispatch_target(kernel)
+    try:
+        method.moe_kernel = None
+        with pytest.raises(AssertionError):
+            _apply_private_request_use(method, layer, view)
+
+        lease = object.__getattribute__(view, "_request_use_lease")
+        assert lease.state is _WNA16RequestUseState.RELEASED
+        assert len(lease.manager._by_id) == 0
+        kernel.apply_private_wna16.assert_not_called()
+        kernel.apply.assert_not_called()
+    finally:
+        registration.close()
+
+
+def test_input_validation_failure_cancels_issued_request_use():
+    kernel = MagicMock()
+    registration, view, method, layer = _request_use_dispatch_target(kernel)
+    try:
+        with pytest.raises(Phase4UnsupportedError) as error:
+            _apply_private_request_use(method, layer, view)
+
+        lease = object.__getattribute__(view, "_request_use_lease")
+        assert error.value.category is Phase4FailureCategory.VALIDATION
+        assert lease.state is _WNA16RequestUseState.RELEASED
+        assert len(lease.manager._by_id) == 0
+        kernel.apply_private_wna16.assert_not_called()
+        kernel.apply.assert_not_called()
+    finally:
+        registration.close()
+
+
+def test_cuda_capture_failure_cancels_issued_request_use():
+    kernel = MagicMock()
+    registration, view, method, layer = _request_use_dispatch_target(kernel)
+    try:
+        with (
+            patch(
+                "vllm.model_executor.layers.quantization.compressed_tensors."
+                "compressed_tensors_moe.compressed_tensors_moe_wna16."
+                "validate_private_wna16_dispatch_inputs"
+            ),
+            patch("torch.cuda.is_current_stream_capturing", return_value=True),
+            pytest.raises(
+                Phase4UnsupportedError, match="does not support CUDA graph capture"
+            )
+            as error,
+        ):
+            _apply_private_request_use(method, layer, view)
+
+        lease = object.__getattribute__(view, "_request_use_lease")
+        assert error.value.category is Phase4FailureCategory.VALIDATION
+        assert lease.state is _WNA16RequestUseState.RELEASED
+        assert len(lease.manager._by_id) == 0
+        kernel.apply_private_wna16.assert_not_called()
+        kernel.apply.assert_not_called()
+    finally:
+        registration.close()
+
+
+def test_completion_event_record_failure_retains_dispatched_request_use():
+    class RecordFailureEvent:
+        def __init__(self, *, enable_timing: bool) -> None:
+            assert enable_timing is False
+
+        def record(self) -> None:
+            raise RuntimeError("record failed")
+
+    kernel = MagicMock()
+    factory = _VerifiedShutdownDrainFactory()
+    registration, view, method, layer = _request_use_dispatch_target(kernel, factory)
+    lease = None
+    try:
+        with (
+            patch(
+                "vllm.model_executor.layers.quantization.compressed_tensors."
+                "compressed_tensors_moe.compressed_tensors_moe_wna16."
+                "validate_private_wna16_dispatch_inputs"
+            ),
+            patch("torch.cuda.is_current_stream_capturing", return_value=False),
+            patch("torch.cuda.Event", RecordFailureEvent),
+            pytest.raises(Phase4UnsupportedError, match="record a completion"),
+        ):
+            _apply_private_request_use(method, layer, view)
+
+        lease = object.__getattribute__(view, "_request_use_lease")
+        assert lease.state is _WNA16RequestUseState.UNFENCED_QUARANTINED
+        assert len(lease.manager._by_id) == 1
+        with pytest.raises(Phase4UnsupportedError) as error:
+            registration.close()
+        assert error.value.category is Phase4FailureCategory.DRAIN_INCOMPLETE
+        assert lease.state is _WNA16RequestUseState.UNFENCED_QUARANTINED
+        assert len(lease.manager._by_id) == 1
+        with pytest.raises(Phase4UnsupportedError) as retry_error:
+            registration.close()
+        assert retry_error.value.category is Phase4FailureCategory.DRAIN_INCOMPLETE
+        with pytest.raises(Phase4UnsupportedError) as stale:
+            acquire_private_wna16_request_use(view)
+        assert stale.value.category is Phase4FailureCategory.STALE_LEASE
+        assert lease is not None
+        factory.expected_lease = lease
+        proof = registration.issue_verified_shutdown_drain_proof(lease)
+        registration.release_verified_drain(lease, proof)
+        assert lease.state is _WNA16RequestUseState.RELEASED
+        assert len(lease.manager._by_id) == 0
+        registration.close()
+    finally:
+        if lease is not None and lease.manager._by_id:
+            factory.expected_lease = lease
+            proof = registration.issue_verified_shutdown_drain_proof(lease)
+            registration.release_verified_drain(lease, proof)
+        registration.close()
+
+
+def test_kernel_error_remains_primary_when_event_record_also_fails():
+    class KernelFailure(Exception):
+        pass
+
+    class RecordFailureEvent:
+        def __init__(self, *, enable_timing: bool) -> None:
+            assert enable_timing is False
+
+        def record(self) -> None:
+            raise RuntimeError("record failed")
+
+    kernel = MagicMock()
+    kernel.apply_private_wna16.side_effect = KernelFailure("kernel failed")
+    factory = _VerifiedShutdownDrainFactory()
+    registration, view, method, layer = _request_use_dispatch_target(kernel, factory)
+    lease = None
+    try:
+        with (
+            patch(
+                "vllm.model_executor.layers.quantization.compressed_tensors."
+                "compressed_tensors_moe.compressed_tensors_moe_wna16."
+                "validate_private_wna16_dispatch_inputs"
+            ),
+            patch("torch.cuda.is_current_stream_capturing", return_value=False),
+            patch("torch.cuda.Event", RecordFailureEvent),
+            pytest.raises(KernelFailure, match="kernel failed"),
+        ):
+            _apply_private_request_use(method, layer, view)
+
+        lease = object.__getattribute__(view, "_request_use_lease")
+        assert lease.state is _WNA16RequestUseState.UNFENCED_QUARANTINED
+        assert len(lease.manager._by_id) == 1
+    finally:
+        if lease is not None and lease.manager._by_id:
+            with pytest.raises(Phase4UnsupportedError) as error:
+                registration.close()
+            assert error.value.category is Phase4FailureCategory.DRAIN_INCOMPLETE
+            factory.expected_lease = lease
+            proof = registration.issue_verified_shutdown_drain_proof(lease)
+            registration.release_verified_drain(lease, proof)
+        registration.close()
 
 
 def test_provider_close_during_dispatch_rejects_before_stable_binding():
