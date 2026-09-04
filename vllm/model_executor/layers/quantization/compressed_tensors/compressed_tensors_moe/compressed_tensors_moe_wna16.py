@@ -5,7 +5,7 @@ import math
 import sys
 from contextlib import suppress
 from fractions import Fraction
-from typing import Any
+from typing import Any, cast
 
 import torch
 from compressed_tensors.quantization import (
@@ -42,6 +42,7 @@ from vllm.model_executor.layers.fused_moe.private_wna16_provider import (
     acquire_private_wna16_request_use,
     begin_private_wna16_request_enqueue,
     cancel_private_wna16_issued_request_use,
+    capture_private_wna16_post_conversion,
     mark_private_wna16_request_dispatched,
     quarantine_private_wna16_request_use_without_fence,
     release_private_wna16_request_use_pending,
@@ -623,6 +624,15 @@ class CompressedTensorsWNA16MoEMethod(CompressedTensorsMoEMethod):
         # Alias packed weights to w13_weight/w2_weight for the modular kernel interface
         layer.w13_weight = layer.w13_weight_packed
         layer.w2_weight = layer.w2_weight_packed
+
+        capture_private_wna16_post_conversion(
+            layer=cast(RoutedExperts, layer),
+            backend=self.wna16_backend,
+            num_bits=self.num_bits,
+            symmetric=self.symmetric,
+            group_size=cast(int, self.group_size),
+            act_order=self.actorder is not None,
+        )
 
         self._setup_kernel(layer)
 

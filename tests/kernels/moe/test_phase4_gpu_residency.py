@@ -31,11 +31,13 @@ from vllm.model_executor.layers.fused_moe.modular_kernel import (
 )
 from vllm.model_executor.layers.fused_moe.oracle.int_wna16 import WNA16MoEBackend
 from vllm.model_executor.layers.fused_moe.private_wna16_provider import (
+    PrivateWNA16ProviderBindingRequest,
     PrivateWNA16ResidencyController,
     _WNA16RequestUseState,
     acquire_private_wna16_request_use,
     begin_private_wna16_request_enqueue,
     bind_private_wna16_generation_view_provider,
+    capture_private_wna16_post_conversion,
     mark_private_wna16_request_dispatched,
     register_private_wna16_provider_factory,
     release_private_wna16_request_use_pending,
@@ -107,6 +109,34 @@ def private_view() -> WNA16GenerationView:
     )
 
 
+def canonical_cpu_bank_layer(*, asymmetric: bool = False):
+    layer = SimpleNamespace(
+        global_num_experts=4,
+        use_ep=False,
+        w13_weight_packed=torch.arange(8, dtype=torch.uint8).reshape(2, 4),
+        w2_weight_packed=torch.arange(8, 16, dtype=torch.uint8).reshape(2, 4),
+        w13_weight_scale=torch.ones(2, 1),
+        w2_weight_scale=torch.full((2, 1), 2.0),
+        w13_weight_zero_point=torch.zeros(2, 1) if asymmetric else None,
+        w2_weight_zero_point=torch.ones(2, 1) if asymmetric else None,
+    )
+    layer.w13_weight = layer.w13_weight_packed
+    layer.w2_weight = layer.w2_weight_packed
+    return layer
+
+
+def _capture_canonical_cpu_bank(controller, layer, *, symmetric=True):
+    controller(PrivateWNA16ProviderBindingRequest(layer_id=3, routed_experts=layer))
+    capture_private_wna16_post_conversion(
+        layer=layer,
+        backend=WNA16MoEBackend.TRITON,
+        num_bits=4,
+        symmetric=symmetric,
+        group_size=32,
+        act_order=False,
+    )
+
+
 def unbound_private_view() -> WNA16GenerationView:
     """A public ABI view has snapshots but cannot issue private storage."""
     view = private_view()
@@ -114,9 +144,7 @@ def unbound_private_view() -> WNA16GenerationView:
     return view
 
 
-def _request_use_dispatch_target(
-    kernel: MagicMock, factory: Callable | None = None
-):
+def _request_use_dispatch_target(kernel: MagicMock, factory: Callable | None = None):
     adapter = Phase4GpuResidencyAdapter(
         enabled=True,
         model_family="Qwen3-30B-A3B",
@@ -193,6 +221,175 @@ def _apply_private_request_use(method, layer, view) -> object:
         shared_experts_input=None,
         generation_view=view,
     )
+
+
+def test_canonical_cpu_bank_is_detached_private_and_one_shot():
+    controller = PrivateWNA16ResidencyController(layer_id=3)
+    registration = register_private_wna16_provider_factory(controller)
+    layer = canonical_cpu_bank_layer()
+    try:
+        _capture_canonical_cpu_bank(controller, layer)
+
+        bank = controller._canonical_cpu_bank
+        assert bank is not None
+        assert bank.layer_id == 3
+        assert bank.global_num_experts == 4
+        assert bank.w13_weight_packed.equal(layer.w13_weight_packed)
+        assert bank.w13_weight_packed.data_ptr() != layer.w13_weight_packed.data_ptr()
+        assert bank.w13_weight_zero_point is None
+        layer.w13_weight_packed.zero_()
+        assert bank.w13_weight_packed.sum().item() > 0
+
+        with pytest.raises(Phase4UnsupportedError, match="unsupported"):
+            _capture_canonical_cpu_bank(controller, layer)
+        assert controller._canonical_cpu_bank is bank
+    finally:
+        registration.close()
+
+
+def test_canonical_cpu_bank_ignores_non_target_layers_and_copies_zero_points():
+    controller = PrivateWNA16ResidencyController(layer_id=3)
+    registration = register_private_wna16_provider_factory(controller)
+    layer = canonical_cpu_bank_layer(asymmetric=True)
+    wrong_layer = canonical_cpu_bank_layer(asymmetric=True)
+    try:
+        capture_private_wna16_post_conversion(
+            layer=cast(RoutedExperts, wrong_layer),
+            backend=WNA16MoEBackend.TRITON,
+            num_bits=4,
+            symmetric=False,
+            group_size=32,
+            act_order=False,
+        )
+        assert controller._canonical_cpu_bank is None
+
+        _capture_canonical_cpu_bank(controller, layer, symmetric=False)
+
+        bank = controller._canonical_cpu_bank
+        assert bank is not None
+        assert bank.w13_weight_zero_point is not None
+        assert bank.w2_weight_zero_point is not None
+        assert (
+            bank.w13_weight_zero_point.data_ptr()
+            != layer.w13_weight_zero_point.data_ptr()
+        )
+        assert controller._canonical_cpu_bank is bank
+    finally:
+        registration.close()
+
+
+def test_canonical_cpu_bank_capture_is_noop_without_registration():
+    layer = canonical_cpu_bank_layer()
+    original = layer.w13_weight_packed.clone()
+
+    capture_private_wna16_post_conversion(
+        layer=layer,
+        backend=WNA16MoEBackend.TRITON,
+        num_bits=4,
+        symmetric=True,
+        group_size=32,
+        act_order=False,
+    )
+
+    assert layer.w13_weight_packed.equal(original)
+    assert layer.w13_weight is layer.w13_weight_packed
+
+
+def test_canonical_cpu_bank_close_drops_private_references():
+    controller = PrivateWNA16ResidencyController(layer_id=3)
+    registration = register_private_wna16_provider_factory(controller)
+    layer = canonical_cpu_bank_layer()
+    _capture_canonical_cpu_bank(controller, layer)
+
+    registration.close()
+
+    assert controller._canonical_cpu_bank is None
+    with pytest.raises(Phase4UnsupportedError, match="stale"):
+        controller.capture_post_conversion(
+            layer=layer,
+            backend=WNA16MoEBackend.TRITON,
+            num_bits=4,
+            symmetric=True,
+            group_size=32,
+            act_order=False,
+        )
+
+
+def test_canonical_cpu_bank_close_waits_for_capture_and_clears_publication():
+    controller = PrivateWNA16ResidencyController(layer_id=3)
+    registration = register_private_wna16_provider_factory(controller)
+    layer = canonical_cpu_bank_layer()
+    entered = Event()
+    release = Event()
+    failures = []
+
+    def blocked_copy(tensor):
+        entered.set()
+        assert release.wait(timeout=3)
+        return tensor.detach().clone().contiguous()
+
+    def capture():
+        try:
+            _capture_canonical_cpu_bank(controller, layer)
+        except BaseException as error:
+            failures.append(error)
+
+    with patch(
+        "vllm.model_executor.layers.fused_moe.private_wna16_provider."
+        "_copy_canonical_wna16_cpu_operand",
+        side_effect=blocked_copy,
+    ):
+        capture_thread = Thread(target=capture)
+        capture_thread.start()
+        assert entered.wait(timeout=3)
+        close_thread = Thread(target=registration.close)
+        close_thread.start()
+        assert close_thread.is_alive()
+        release.set()
+        capture_thread.join(timeout=3)
+        close_thread.join(timeout=3)
+
+    assert not failures
+    assert not capture_thread.is_alive()
+    assert not close_thread.is_alive()
+    assert controller._canonical_cpu_bank is None
+
+
+def test_canonical_cpu_bank_copy_failure_never_publishes_partial_bank():
+    controller = PrivateWNA16ResidencyController(layer_id=3)
+    registration = register_private_wna16_provider_factory(controller)
+    layer = canonical_cpu_bank_layer()
+    try:
+        with (
+            patch(
+                "vllm.model_executor.layers.fused_moe.private_wna16_provider."
+                "_copy_canonical_wna16_cpu_operand",
+                side_effect=RuntimeError("copy failed"),
+            ),
+            pytest.raises(Phase4UnsupportedError, match="copy failed"),
+        ):
+            _capture_canonical_cpu_bank(controller, layer)
+        assert controller._canonical_cpu_bank is None
+    finally:
+        registration.close()
+
+
+def test_generic_provider_factory_close_is_not_a_lifecycle_callback():
+    class Factory:
+        closed = False
+
+        def __call__(self, _):
+            return lambda **_: unbound_private_view()
+
+        def close(self):
+            self.closed = True
+
+    factory = Factory()
+    registration = register_private_wna16_provider_factory(cast(Callable, factory))
+
+    registration.close()
+
+    assert factory.closed is False
 
 
 def test_default_off_is_explicit_and_fail_closed():
@@ -764,9 +961,7 @@ def test_wna16_private_dispatch_cuda_forwarding_seam():
         w13_scale=torch.ones((2, 64, 1), device="cuda"),
         w2_scale=torch.ones((2, 32, 1), device="cuda"),
     )
-    lease = WNA16UseLease(
-        layer_id=3, generation=9, bundle=private_bundle, token=1
-    )
+    lease = WNA16UseLease(layer_id=3, generation=9, bundle=private_bundle, token=1)
     view = WNA16GenerationView(
         bundle=private_bundle,
         slot_map=torch.tensor([0, -1, 1, -1], device="cuda", dtype=torch.int32),
@@ -1446,6 +1641,7 @@ def test_close_failure_remains_primary_over_recorded_event_query_error():
 
     kernel = MagicMock()
     registration, view, method, layer = _request_use_dispatch_target(kernel)
+
     def close_registration(*_args, **_kwargs):
         registration.close()
 
@@ -1932,8 +2128,7 @@ def test_cuda_capture_failure_cancels_issued_request_use():
             patch("torch.cuda.is_current_stream_capturing", return_value=True),
             pytest.raises(
                 Phase4UnsupportedError, match="does not support CUDA graph capture"
-            )
-            as error,
+            ) as error,
         ):
             _apply_private_request_use(method, layer, view)
 

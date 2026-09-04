@@ -64,6 +64,27 @@ class PrivateWNA16ProviderFactory(Protocol):
         ...
 
 
+@dataclass(frozen=True, slots=True)
+class _CanonicalWNA16CpuBank:
+    """Controller-private detached CPU source for a future transfer controller."""
+
+    layer_id: int
+    global_num_experts: int
+    num_bits: int
+    symmetric: bool
+    group_size: int
+    w13_weight_packed: torch.Tensor
+    w2_weight_packed: torch.Tensor
+    w13_weight_scale: torch.Tensor
+    w2_weight_scale: torch.Tensor
+    w13_weight_zero_point: torch.Tensor | None
+    w2_weight_zero_point: torch.Tensor | None
+
+
+def _copy_canonical_wna16_cpu_operand(tensor: torch.Tensor) -> torch.Tensor:
+    return tensor.detach().to(device="cpu").clone().contiguous()
+
+
 class _WNA16RequestUseState(Enum):
     ISSUED = auto()
     ACQUIRED = auto()
@@ -257,9 +278,7 @@ class _WNA16RequestUseLeaseManager:
             except Exception as error:
                 raise _event_query_error("completion event query failed") from error
             if type(result) is not bool:
-                raise _event_query_error(
-                    "completion event query did not return bool"
-                )
+                raise _event_query_error("completion event query did not return bool")
             completed = result
         finally:
             with self._lock:
@@ -416,6 +435,7 @@ class _ActiveRegistration:
     capability: _WNA16StableSlotCapability
     request_use_manager: _WNA16RequestUseLeaseManager
     request_drain_authority: _WNA16RequestDrainAuthority
+    controller_close: Callable[[], None] | None
     closed: bool = False
 
 
@@ -456,10 +476,8 @@ class PrivateWNA16ProviderFactoryRegistration:
         lease: _WNA16RequestUseLease,
     ) -> _WNA16VerifiedDrainProof:
         """Request a shutdown-only proof from the registered controller verifier."""
-        return (
-            self._registration.request_drain_authority
-            .issue_verified_shutdown_drain_proof(lease)
-        )
+        authority = self._registration.request_drain_authority
+        return authority.issue_verified_shutdown_drain_proof(lease)
 
     def release_verified_drain(
         self, lease: _WNA16RequestUseLease, proof: _WNA16VerifiedDrainProof
@@ -480,6 +498,8 @@ class PrivateWNA16ProviderFactoryRegistration:
                 self._registration.closed = True
                 self._registration.capability.revoke()
         self._registration.request_use_manager.close()
+        if self._registration.controller_close is not None:
+            self._registration.controller_close()
         with _registry_lock:
             if _active_registration is self._registration:
                 _active_registration = None
@@ -531,7 +551,11 @@ class PrivateWNA16ResidencyController:
     """Per-worker placeholder for the future CPU-to-GPU transfer controller."""
 
     def __init__(self, layer_id: int) -> None:
+        self._lifecycle_lock = RLock()
         self._layer_id = layer_id
+        self._bound_routed_experts: RoutedExperts | None = None
+        self._canonical_cpu_bank: _CanonicalWNA16CpuBank | None = None
+        self._closed = False
 
     def __call__(
         self, request: PrivateWNA16ProviderBindingRequest
@@ -555,7 +579,107 @@ class PrivateWNA16ResidencyController:
         """Bind only the configured layer and fail closed until transfer exists."""
         if request.layer_id != self._layer_id:
             raise _lifecycle_error("private WNA16 controller received another layer")
+        with self._lifecycle_lock:
+            if (
+                self._bound_routed_experts is not None
+                and self._bound_routed_experts is not request.routed_experts
+            ):
+                raise _lifecycle_error(
+                    "private WNA16 controller received another layer"
+                )
+            self._bound_routed_experts = request.routed_experts
         return self._request_generation_view
+
+    def capture_post_conversion(
+        self,
+        *,
+        layer: RoutedExperts,
+        backend: object,
+        num_bits: int,
+        symmetric: bool,
+        group_size: int,
+        act_order: bool,
+    ) -> None:
+        """Publish one detached CPU snapshot after Triton conversion completes."""
+        with self._lifecycle_lock:
+            if self._closed:
+                raise _lifecycle_error(
+                    "private WNA16 canonical CPU bank is stale", stale=True
+                )
+            if layer is not self._bound_routed_experts:
+                return
+            if (
+                str(getattr(backend, "value", backend)).lower() != "triton"
+                or num_bits not in (4, 8)
+                or group_size != 32
+                or act_order
+                or getattr(layer, "use_ep", False)
+                or self._canonical_cpu_bank is not None
+            ):
+                raise _lifecycle_error(
+                    "private WNA16 canonical CPU bank is unsupported"
+                )
+            w13_weight = getattr(layer, "w13_weight", None)
+            w2_weight = getattr(layer, "w2_weight", None)
+            w13_packed = getattr(layer, "w13_weight_packed", None)
+            w2_packed = getattr(layer, "w2_weight_packed", None)
+            w13_scale = getattr(layer, "w13_weight_scale", None)
+            w2_scale = getattr(layer, "w2_weight_scale", None)
+            w13_zero = getattr(layer, "w13_weight_zero_point", None)
+            w2_zero = getattr(layer, "w2_weight_zero_point", None)
+            required = (w13_packed, w2_packed, w13_scale, w2_scale)
+            if (
+                w13_weight is not w13_packed
+                or w2_weight is not w2_packed
+                or not all(isinstance(tensor, torch.Tensor) for tensor in required)
+                or (symmetric and (w13_zero is not None or w2_zero is not None))
+                or (
+                    not symmetric
+                    and not isinstance(w13_zero, torch.Tensor)
+                    or not symmetric
+                    and not isinstance(w2_zero, torch.Tensor)
+                )
+            ):
+                raise _lifecycle_error(
+                    "private WNA16 canonical CPU operands are invalid"
+                )
+            try:
+                bank = _CanonicalWNA16CpuBank(
+                    layer_id=self._layer_id,
+                    global_num_experts=layer.global_num_experts,
+                    num_bits=num_bits,
+                    symmetric=symmetric,
+                    group_size=group_size,
+                    w13_weight_packed=_copy_canonical_wna16_cpu_operand(
+                        cast(torch.Tensor, w13_packed)
+                    ),
+                    w2_weight_packed=_copy_canonical_wna16_cpu_operand(
+                        cast(torch.Tensor, w2_packed)
+                    ),
+                    w13_weight_scale=_copy_canonical_wna16_cpu_operand(
+                        cast(torch.Tensor, w13_scale)
+                    ),
+                    w2_weight_scale=_copy_canonical_wna16_cpu_operand(
+                        cast(torch.Tensor, w2_scale)
+                    ),
+                    w13_weight_zero_point=_copy_canonical_wna16_cpu_operand(w13_zero)
+                    if w13_zero is not None
+                    else None,
+                    w2_weight_zero_point=_copy_canonical_wna16_cpu_operand(w2_zero)
+                    if w2_zero is not None
+                    else None,
+                )
+            except Exception as error:
+                raise _lifecycle_error(
+                    "private WNA16 canonical CPU copy failed"
+                ) from error
+            self._canonical_cpu_bank = bank
+
+    def close(self) -> None:
+        with self._lifecycle_lock:
+            self._closed = True
+            self._canonical_cpu_bank = None
+            self._bound_routed_experts = None
 
     def _request_generation_view(
         self,
@@ -589,18 +713,51 @@ def register_private_wna16_provider_factory(
             )
         manager = _WNA16RequestUseLeaseManager()
         epoch = object()
-        authority = _WNA16RequestDrainAuthority(
-            manager, epoch, verifier
-        )
+        authority = _WNA16RequestDrainAuthority(manager, epoch, verifier)
         manager.set_drain_authority(authority)
         registration = _ActiveRegistration(
             factory,
             _new_controller_wna16_stable_slot_capability(),
             manager,
             authority,
+            (
+                factory.close
+                if isinstance(factory, PrivateWNA16ResidencyController)
+                else None
+            ),
         )
         _active_registration = registration
         return PrivateWNA16ProviderFactoryRegistration(registration)
+
+
+def capture_private_wna16_post_conversion(
+    *,
+    layer: RoutedExperts,
+    backend: object,
+    num_bits: int,
+    symmetric: bool,
+    group_size: int,
+    act_order: bool,
+) -> None:
+    """Offer finalized WNA16 operands to an active private controller only."""
+    with _registry_lock:
+        registration = _active_registration
+        if registration is None:
+            return
+        if registration.closed:
+            raise _lifecycle_error(
+                "private WNA16 canonical CPU bank is stale", stale=True
+            )
+        capture = getattr(registration.factory, "capture_post_conversion", None)
+    if capture is not None:
+        capture(
+            layer=layer,
+            backend=backend,
+            num_bits=num_bits,
+            symmetric=symmetric,
+            group_size=group_size,
+            act_order=act_order,
+        )
 
 
 def bind_private_wna16_generation_view_provider(
@@ -638,8 +795,6 @@ def bind_private_wna16_generation_view_provider(
             )
         binding = PrivateWNA16ProviderFactoryRegistration(registration)
     routed_experts.set_private_wna16_generation_view_provider(
-        _RevocablePrivateWNA16Provider(
-            binding, provider, registration.capability
-        ),
+        _RevocablePrivateWNA16Provider(binding, provider, registration.capability),
         layer_id=layer_id,
     )
