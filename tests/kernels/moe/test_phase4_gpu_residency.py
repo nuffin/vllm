@@ -3476,6 +3476,188 @@ def test_cpu_generation_transaction_rollback_failure_retains_retry_ownership():
         controller.close()
 
 
+def test_prepared_cuda_h2d_records_on_destination_copy_stream_and_device():
+    """Mocked multi-GPU seam: the H2D fence follows the destination stream."""
+    calls: list[str] = []
+    destination_device = torch.device("cuda:1")
+
+    class Context:
+        def __init__(self, name: str) -> None:
+            self.name = name
+
+        def __enter__(self):
+            calls.append(f"{self.name}-enter")
+            return self
+
+        def __exit__(self, *_):
+            calls.append(f"{self.name}-exit")
+
+    class Destination:
+        is_cuda = True
+        device = destination_device
+
+        def __init__(self, name: str) -> None:
+            self.name = name
+
+        def __getitem__(self, _):
+            return self
+
+        def copy_(self, _, *, non_blocking: bool) -> None:
+            assert non_blocking is True
+            calls.append(f"{self.name}-copy")
+
+    class CompletionEvent:
+        def record(self, stream) -> None:
+            assert stream is copy_stream
+            calls.append("event-record")
+
+        def query(self) -> bool:
+            return True
+
+    copy_stream = Context("stream")
+    controller = _staging_controller()
+    staged = _WNA16StagedCudaSlot(
+        cast(torch.Tensor, Destination("w13")),
+        cast(torch.Tensor, Destination("w2")),
+        cast(torch.Tensor, Destination("w13-scale")),
+        cast(torch.Tensor, Destination("w2-scale")),
+        None,
+        None,
+        cast(torch.Tensor, Destination("slot-map")),
+    )
+    try:
+        with (
+            patch.object(controller, "_validate_cuda_h2d_destination"),
+            patch(
+                "torch.accelerator.current_stream", return_value=copy_stream
+            ) as current_stream,
+        ):
+            transaction = controller._prepare_controller_private_cuda_h2d_transaction(
+                expert_id=0, staged_slot=staged
+            )
+
+            def fill_event_factory() -> CompletionEvent:
+                calls.append("event-create")
+                return CompletionEvent()
+
+            controller._enqueue_prepared_controller_private_cuda_h2d_transaction(
+                transaction, fill_event_factory=fill_event_factory
+            )
+
+        current_stream.assert_called_once_with(destination_device)
+        assert calls == [
+            "event-create",
+            "stream-enter",
+            "w13-copy",
+            "w2-copy",
+            "w13-scale-copy",
+            "w2-scale-copy",
+            "slot-map-copy",
+            "event-record",
+            "stream-exit",
+        ]
+        controller._finalize_completed_cpu_source_slot_retentions()
+        assert not controller._retained_cpu_source_slots
+        assert not controller._reservations
+    finally:
+        controller.close()
+
+
+def test_prepared_cuda_h2d_cpu_fake_uses_immutable_map_snapshot():
+    """CPU fake: caller map mutation cannot alter the validated enqueue source."""
+
+    class CompleteEvent:
+        def record(self):
+            pass
+
+        def query(self):
+            return True
+
+    controller = _staging_controller()
+    staged = staged_cpu_slot(controller)
+    try:
+        with patch.object(controller, "_validate_cuda_h2d_destination"):
+            transaction = controller._prepare_controller_private_cuda_h2d_transaction(
+                expert_id=0, staged_slot=staged
+            )
+        leaked_map = transaction.candidate_cpu_slot_map
+        leaked_map[0] = -1
+        assert transaction.candidate_cpu_slot_map.tolist() == [0, -1, -1, -1]
+        controller._enqueue_prepared_controller_private_cuda_h2d_transaction(
+            transaction, fill_event_factory=CompleteEvent
+        )
+        assert staged.slot_map.tolist() == [0, -1, -1, -1]
+        controller._finalize_completed_cpu_source_slot_retentions()
+        assert not controller._retained_cpu_source_slots
+        assert not controller._reservations
+    finally:
+        controller.close()
+
+
+def test_prepared_cuda_h2d_cpu_fake_factory_failure_rolls_back_before_copy():
+    """CPU fake: pre-copy factory failure releases only the exact reservation."""
+    controller = _staging_controller()
+    staged = staged_cpu_slot(controller)
+    original = staged.w13_weight_packed.clone()
+    try:
+        with patch.object(controller, "_validate_cuda_h2d_destination"):
+            transaction = controller._prepare_controller_private_cuda_h2d_transaction(
+                expert_id=0, staged_slot=staged
+            )
+        with pytest.raises(RuntimeError, match="factory failed"):
+            controller._enqueue_prepared_controller_private_cuda_h2d_transaction(
+                transaction,
+                fill_event_factory=lambda: (_ for _ in ()).throw(
+                    RuntimeError("factory failed")
+                ),
+            )
+        assert torch.equal(staged.w13_weight_packed, original)
+        assert not controller._prepared_cuda_h2d_transactions
+        assert not controller._retained_cpu_source_slots
+        assert not controller._reservations
+        assert controller._slots[0].state.name == "ABSENT"
+        reservation = controller._plan_slot_transaction(0).reservation
+        assert reservation is not None
+        controller._rollback_slot_transaction(reservation)
+    finally:
+        controller.close()
+
+
+def test_prepared_cuda_h2d_cpu_fake_record_failure_quarantines_after_copy():
+    """CPU fake: post-copy fence failure retains source and rejects rollback."""
+
+    class RecordFailureEvent:
+        def record(self):
+            raise RuntimeError("record failed")
+
+    controller = _staging_controller()
+    staged = staged_cpu_slot(controller)
+    with patch.object(controller, "_validate_cuda_h2d_destination"):
+        transaction = controller._prepare_controller_private_cuda_h2d_transaction(
+            expert_id=0, staged_slot=staged
+        )
+    with pytest.raises(RuntimeError, match="record failed"):
+        controller._enqueue_prepared_controller_private_cuda_h2d_transaction(
+            transaction, fill_event_factory=RecordFailureEvent
+        )
+
+    bank = controller._canonical_cpu_bank
+    assert bank is not None
+    assert torch.equal(staged.w13_weight_packed[0], bank.w13_weight_packed[0])
+    assert staged.slot_map.tolist() == [0, -1, -1, -1]
+    assert not controller._prepared_cuda_h2d_transactions
+    assert transaction.reservation.token in controller._reservations
+    assert len(controller._retained_cpu_source_slots) == 1
+    controller._finalize_completed_cpu_source_slot_retentions()
+    assert len(controller._retained_cpu_source_slots) == 1
+    with pytest.raises(Phase4UnsupportedError) as error:
+        controller._rollback_slot_transaction(transaction.reservation)
+    assert error.value.category is Phase4FailureCategory.STALE_LEASE
+    with pytest.raises(Phase4UnsupportedError) as error:
+        controller.close()
+    assert error.value.category is Phase4FailureCategory.DRAIN_INCOMPLETE
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")
 def test_prepared_cuda_h2d_transaction_rejects_forgery_and_replay():
     """CUDA preflight only: prepared H2D reservations are exact and one-shot."""
@@ -3500,6 +3682,37 @@ def test_prepared_cuda_h2d_transaction_rejects_forgery_and_replay():
         assert error.value.category is Phase4FailureCategory.STALE_LEASE
         assert not controller._reservations
         assert not controller._prepared_cuda_h2d_transactions
+    finally:
+        controller.close()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")
+def test_prepared_cuda_h2d_transaction_enqueues_unpublished_source_fill():
+    """CUDA source seam only: copied operands/map remain unpublished."""
+    controller = _staging_controller()
+    try:
+        transaction = controller._prepare_controller_private_cuda_h2d_transaction(
+            expert_id=0, staged_slot=staged_cuda_slot(controller)
+        )
+        staged = transaction.staged_slot
+        leaked_map = transaction.candidate_cpu_slot_map
+        leaked_map[0] = -1
+        assert transaction.candidate_cpu_slot_map.tolist() == [0, -1, -1, -1]
+        controller._enqueue_prepared_controller_private_cuda_h2d_transaction(
+            transaction,
+            fill_event_factory=lambda: torch.cuda.Event(enable_timing=False),
+        )
+        retention = next(iter(controller._retained_cpu_source_slots.values()))
+        retention.completion.synchronize()
+        bank = controller._canonical_cpu_bank
+        assert bank is not None
+        assert torch.equal(staged.w13_weight_packed[0].cpu(), bank.w13_weight_packed[0])
+        assert torch.equal(staged.w2_weight_packed[0].cpu(), bank.w2_weight_packed[0])
+        assert staged.slot_map.cpu().tolist() == [0, -1, -1, -1]
+        assert not controller._prepared_cuda_h2d_transactions
+        controller._finalize_completed_cpu_source_slot_retentions()
+        assert not controller._retained_cpu_source_slots
+        assert not controller._reservations
     finally:
         controller.close()
 

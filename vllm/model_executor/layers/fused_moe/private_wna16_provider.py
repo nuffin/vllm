@@ -131,6 +131,13 @@ class _WNA16CpuSourceSlotRetention:
     token: object
 
 
+class _UnfencedCudaH2DCompletion:
+    """Permanent fail-closed retention after an H2D fence cannot be recorded."""
+
+    def query(self) -> bool:
+        return False
+
+
 @dataclass(frozen=True, slots=True)
 class _WNA16StagedCudaSlot:
     """Controller-private destination ABI for future CUDA slot publication.
@@ -162,6 +169,19 @@ class _WNA16PreparedCudaH2DTransaction:
     candidate_cpu_slot_map: torch.Tensor
     staged_slot: _WNA16StagedCudaSlot
     token: object
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "candidate_cpu_slot_map",
+            self.candidate_cpu_slot_map.detach().clone().contiguous(),
+        )
+
+    def __getattribute__(self, name: str) -> object:
+        value = object.__getattribute__(self, name)
+        if name == "candidate_cpu_slot_map" and isinstance(value, torch.Tensor):
+            return value.detach().clone()
+        return value
 
 
 @dataclass(frozen=True, slots=True)
@@ -1347,6 +1367,89 @@ class PrivateWNA16ResidencyController:
                 )
             del self._prepared_cuda_h2d_transactions[transaction.token]
         self._rollback_slot_transaction(transaction.reservation)
+
+    def _enqueue_prepared_controller_private_cuda_h2d_transaction(
+        self,
+        transaction: _WNA16PreparedCudaH2DTransaction,
+        *,
+        fill_event_factory: Callable[[], object],
+    ) -> None:
+        """Enqueue one unpublished CPU-to-CUDA slot fill and retain its source.
+
+        This is an internal source-transfer seam only: it never publishes a map,
+        changes logical residency, or issues a generation view.  The exact
+        prepared transaction remains the ownership boundary until all copies and
+        its completion fence are established.
+        """
+        with self._lifecycle_lock:
+            if (
+                not isinstance(transaction, _WNA16PreparedCudaH2DTransaction)
+                or transaction.controller is not self
+                or self._closed
+                or self._prepared_cuda_h2d_transactions.get(transaction.token)
+                is not transaction
+                or self._reservations.get(transaction.reservation.token)
+                is not transaction.reservation
+                or not callable(fill_event_factory)
+            ):
+                raise _lifecycle_error(
+                    "private WNA16 CUDA H2D transaction is stale", stale=True
+                )
+            bank = self._canonical_cpu_bank
+            if bank is None:
+                raise _lifecycle_error("private WNA16 CPU staging is stale", stale=True)
+            staged = transaction.staged_slot
+            reservation = transaction.reservation
+            copy_enqueued = False
+            try:
+                event = fill_event_factory()
+                record = getattr(event, "record", None)
+                if not callable(record):
+                    raise _lifecycle_error(
+                        "private WNA16 CUDA fill event has no callable record"
+                    )
+
+                def enqueue_payload() -> None:
+                    nonlocal copy_enqueued
+                    for source, destination in (
+                        (bank.w13_weight_packed, staged.w13_weight_packed),
+                        (bank.w2_weight_packed, staged.w2_weight_packed),
+                        (bank.w13_weight_scale, staged.w13_weight_scale),
+                        (bank.w2_weight_scale, staged.w2_weight_scale),
+                        (bank.w13_weight_zero_point, staged.w13_weight_zero_point),
+                        (bank.w2_weight_zero_point, staged.w2_weight_zero_point),
+                    ):
+                        if source is not None and destination is not None:
+                            copy_enqueued = True
+                            destination[reservation.slot].copy_(
+                                source[reservation.expert_id], non_blocking=True
+                            )
+                    copy_enqueued = True
+                    staged.slot_map.copy_(
+                        object.__getattribute__(transaction, "candidate_cpu_slot_map"),
+                        non_blocking=True,
+                    )
+
+                if staged.slot_map.is_cuda:
+                    destination_device = staged.slot_map.device
+                    copy_stream = torch.accelerator.current_stream(destination_device)
+                    with copy_stream:
+                        enqueue_payload()
+                        record(copy_stream)
+                else:
+                    enqueue_payload()
+                    record()
+            except BaseException:
+                del self._prepared_cuda_h2d_transactions[transaction.token]
+                if copy_enqueued:
+                    self._retain_cpu_source_slot_until_completion(
+                        reservation, _UnfencedCudaH2DCompletion()
+                    )
+                else:
+                    self._rollback_slot_transaction(reservation)
+                raise
+            self._retain_cpu_source_slot_until_completion(reservation, event)
+            del self._prepared_cuda_h2d_transactions[transaction.token]
 
     def _build_cpu_candidate_slot_map(
         self, reservation: _WNA16SlotReservation
