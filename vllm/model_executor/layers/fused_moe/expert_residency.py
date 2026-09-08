@@ -1414,14 +1414,22 @@ def validate_private_wna16_dispatch_inputs(
             "private WNA16 router tensors must be contiguous rank-2 int32 IDs",
         )
     flattened_ids = topk_ids.reshape(-1)
-    if bool(((flattened_ids < 0) | (flattened_ids >= global_num_experts)).any()):
+    # Expert id -1 is the masked/padding token sentinel: such tokens contribute
+    # no routed-expert output and are handled by the Triton WNA16 dispatch the
+    # same way the ordinary path handles them. Only ids outside [-1, experts)
+    # are invalid.
+    if bool(((flattened_ids < -1) | (flattened_ids >= global_num_experts)).any()):
         raise Phase4UnsupportedError(
             Phase4FailureCategory.VALIDATION,
             "private WNA16 router IDs are outside the global expert domain",
         )
-    selected_slots = operands.slot_map.index_select(0, flattened_ids.to(torch.long))
-    if bool((selected_slots == -1).any()):
-        raise Phase4UnsupportedError(
-            Phase4FailureCategory.VALIDATION,
-            "private WNA16 dispatch requires every routed expert to be resident",
+    routed_ids = flattened_ids[flattened_ids >= 0]
+    if bool(routed_ids.numel() > 0):
+        selected_slots = operands.slot_map.index_select(
+            0, routed_ids.to(torch.long)
         )
+        if bool((selected_slots == -1).any()):
+            raise Phase4UnsupportedError(
+                Phase4FailureCategory.VALIDATION,
+                "private WNA16 dispatch requires every routed expert to be resident",
+            )

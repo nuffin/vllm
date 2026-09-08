@@ -4243,3 +4243,85 @@ def test_pre_publication_failure_rolls_back_and_restores_old_publication():
         )
     finally:
         controller.close()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")
+def test_private_dispatch_validation_accepts_masked_router_ids():
+    """Masked id -1 is a no-expert token, not an invalid routed expert."""
+    view, _ = cuda_private_view()
+    hidden = torch.ones((1, 2), device="cuda")
+    weights = torch.ones((1, 4), device="cuda")
+    validate_private_wna16_dispatch_inputs(
+        view,
+        hidden_states=hidden,
+        topk_ids=torch.tensor([[0, 2, -1, -1]], device="cuda", dtype=torch.int32),
+        topk_weights=weights,
+        global_num_experts=4,
+        layer_id=3,
+    )
+    with pytest.raises(Phase4UnsupportedError) as error:
+        validate_private_wna16_dispatch_inputs(
+            view,
+            hidden_states=hidden,
+            topk_ids=torch.tensor([[1, -1]], device="cuda", dtype=torch.int32),
+            topk_weights=torch.ones((1, 2), device="cuda"),
+            global_num_experts=4,
+            layer_id=3,
+        )
+    assert "every routed expert to be resident" in str(error.value)
+    with pytest.raises(Phase4UnsupportedError) as error:
+        validate_private_wna16_dispatch_inputs(
+            view,
+            hidden_states=hidden,
+            topk_ids=torch.tensor([[-2]], device="cuda", dtype=torch.int32),
+            topk_weights=torch.ones((1, 1), device="cuda"),
+            global_num_experts=4,
+            layer_id=3,
+        )
+    assert "outside the global expert domain" in str(error.value)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")
+def test_masked_ids_are_ignored_when_planning_generation_route():
+    """-1 masked tokens never count as selected experts."""
+    controller = _abi_staging_controller()
+    try:
+        weights = torch.tensor([[0.5, 0.5, 0.0, 0.0]], device="cuda")
+        view = controller._request_generation_view(
+            topk_ids=torch.tensor([[0, 1, -1, -1]], device="cuda", dtype=torch.int32),
+            topk_weights=weights,
+        )
+        assert view.slot_map.tolist() == [0, 1, -1, -1]
+        assert controller._published_cpu_slot_map is not None
+        assert controller._published_cpu_slot_map.tolist() == [0, 1, -1, -1]
+    finally:
+        controller.close()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")
+def test_masked_only_route_publishes_empty_generation_without_touching_bookkeeping():
+    """An all-masked batch gets an empty view; prior publication stays current."""
+    controller = _abi_staging_controller()
+    try:
+        weights = torch.tensor([[0.5, 0.5]], device="cuda")
+        real_view = controller._request_generation_view(
+            topk_ids=torch.tensor([[0, 1]], device="cuda", dtype=torch.int32),
+            topk_weights=weights,
+        )
+        generation_before = controller._next_cpu_generation
+        map_before = controller._published_cpu_slot_map
+        assert map_before is not None
+        fills_before = dict(controller._pending_cuda_generation_fills)
+        masked_view = controller._request_generation_view(
+            topk_ids=torch.tensor([[-1, -1]], device="cuda", dtype=torch.int32),
+            topk_weights=weights,
+        )
+        assert masked_view is not real_view
+        assert masked_view.slot_map.tolist() == [-1, -1, -1, -1]
+        assert controller._published_generation is real_view
+        assert controller._published_cpu_slot_map is not None
+        assert torch.equal(controller._published_cpu_slot_map, map_before)
+        assert controller._next_cpu_generation == generation_before
+        assert controller._pending_cuda_generation_fills == fills_before
+    finally:
+        controller.close()

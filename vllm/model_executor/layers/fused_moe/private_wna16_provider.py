@@ -2150,23 +2150,83 @@ class PrivateWNA16ResidencyController:
         topk_ids: torch.Tensor,
         topk_weights: torch.Tensor,
     ) -> WNA16GenerationView:
-        """Fill/publish or reuse one immutable private CUDA generation."""
+        """Fill/publish or reuse one immutable private CUDA generation.
+
+        Masked/padding tokens carry expert id -1 and contribute no routed
+        output; they are excluded from the generation route. A batch whose
+        route is entirely masked publishes an empty immutable generation.
+        """
         del topk_weights
         if not topk_ids.is_cuda or topk_ids.dtype is not torch.int32:
             raise _lifecycle_error("private WNA16 route IDs must be CUDA int32")
         expert_ids = tuple(
             dict.fromkeys(
-                int(item) for item in topk_ids.detach().flatten().cpu().tolist()
+                int(item)
+                for item in topk_ids.detach().flatten().cpu().tolist()
+                if int(item) >= 0
             )
         )
         if not expert_ids:
-            raise _lifecycle_error("private WNA16 route has no selected experts")
+            return self._publish_empty_controller_generation_view(
+                device=topk_ids.device
+            )
         reused = self._reusable_controller_generation_view(expert_ids)
         if reused is not None:
             return reused
         return self._publish_fresh_controller_generation_view(
             expert_ids=expert_ids, device=topk_ids.device
         )
+
+    def _publish_empty_controller_generation_view(
+        self, *, device: torch.device
+    ) -> WNA16GenerationView:
+        """Publish an all-masked private view with no routed experts.
+
+        An empty generation keeps private dispatch total for masked-only
+        batches (for example engine warmup/profiling padding) without touching
+        the published generation bookkeeping, so a subsequent real route can
+        still reuse the last complete generation.
+        """
+        with self._lifecycle_lock:
+            bank = self._canonical_cpu_bank
+            slots = len(self._slots)
+            if self._closed or bank is None or not slots:
+                raise _lifecycle_error("private WNA16 empty generation is unavailable")
+            generation = self._next_cpu_generation + 1
+
+            def allocate(source: torch.Tensor | None) -> torch.Tensor | None:
+                if source is None:
+                    return None
+                return torch.empty(
+                    (slots, *source.shape[1:]), device=device, dtype=source.dtype
+                )
+
+            w13 = allocate(bank.w13_weight_packed)
+            w2 = allocate(bank.w2_weight_packed)
+            w13_scale = allocate(bank.w13_weight_scale)
+            w2_scale = allocate(bank.w2_weight_scale)
+            w13_zero = allocate(bank.w13_weight_zero_point)
+            w2_zero = allocate(bank.w2_weight_zero_point)
+            assert w13 is not None and w2 is not None
+            assert w13_scale is not None and w2_scale is not None
+            slot_map = torch.full(
+                (bank.global_num_experts,), -1, dtype=torch.int32, device=device
+            )
+            bundle = WNA16ExpertBundle(
+                schema_version=1, backend="triton", layer_id=self._layer_id,
+                global_num_experts=slot_map.shape[0], slot_count=slots,
+                generation=generation, quant_type="W4A16", num_bits=4,
+                symmetric=True, group_size=32, act_order=False, w13=w13, w2=w2,
+                w13_scale=w13_scale, w2_scale=w2_scale, w13_zero=w13_zero, w2_zero=w2_zero,
+            )
+            view = WNA16GenerationView(
+                bundle=bundle, slot_map=slot_map, map_generation=generation,
+                use_lease=WNA16UseLease(
+                    self._layer_id, generation, bundle, generation
+                ),
+            )
+            self._bind_controller_request_use_capabilities(view, ())
+            return view
 
 
 def register_private_wna16_provider_factory(
