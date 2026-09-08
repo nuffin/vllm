@@ -82,11 +82,19 @@ def _make_worker(engine: _RecordingEngine | None) -> Worker:
 
 
 def _make_lifecycle_worker(
-    layer_id: int | None, *, weight_transfer_config: object | None = None
+    layer_id: int | None,
+    *,
+    private_test_only: bool = True,
+    slot_count: int | None = 2,
+    weight_transfer_config: object | None = None,
 ) -> Worker:
     worker = object.__new__(Worker)
     worker.vllm_config = SimpleNamespace(
-        model_config=SimpleNamespace(private_wna16_residency_layer=layer_id),
+        model_config=SimpleNamespace(
+            private_wna16_residency_layer=layer_id,
+            private_wna16_residency_test_only=private_test_only,
+            private_wna16_residency_slot_count=slot_count,
+        ),
         weight_transfer_config=weight_transfer_config,
     )
     worker.device = object()
@@ -122,6 +130,37 @@ def test_load_model_without_private_wna16_leaves_provider_unconfigured():
     assert worker._private_wna16_residency_controller is None
     assert worker._private_wna16_provider_registration is None
     _assert_private_provider_registry_absent()
+
+
+def test_load_model_rejects_private_selector_without_test_only_slot_gate():
+    worker = _make_lifecycle_worker(3, private_test_only=False, slot_count=2)
+
+    with (
+        patch.object(
+            gpu_worker, "set_current_vllm_config", return_value=nullcontext()
+        ),
+        pytest.raises(RuntimeError, match="test-only fixed slot count"),
+    ):
+        Worker.load_model(worker)
+
+    worker.model_runner.load_model.assert_not_called()
+    assert worker._private_wna16_residency_controller is None
+    assert worker._private_wna16_provider_registration is None
+    _assert_private_provider_registry_absent()
+
+
+def test_load_model_passes_fixed_private_slot_count_to_controller():
+    worker = _make_lifecycle_worker(3, slot_count=7)
+
+    with patch.object(
+        gpu_worker, "set_current_vllm_config", return_value=nullcontext()
+    ):
+        Worker.load_model(worker)
+
+    controller = worker._private_wna16_residency_controller
+    assert controller is not None
+    assert controller._slot_count == 7
+    assert worker._private_wna16_provider_registration is not None
 
 
 def test_load_model_closes_private_provider_after_runner_base_exception():

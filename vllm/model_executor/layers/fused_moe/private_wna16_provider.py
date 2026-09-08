@@ -23,7 +23,10 @@ import torch
 from vllm.model_executor.layers.fused_moe.expert_residency import (
     Phase4FailureCategory,
     Phase4UnsupportedError,
+    WNA16ExpertBundle,
     WNA16GenerationView,
+    WNA16UseLease,
+    _bind_controller_wna16_cuda_map_authority,
     _bind_controller_wna16_slot_storage,
     _new_controller_wna16_stable_slot_capability,
     _WNA16StableSlotCapability,
@@ -324,6 +327,24 @@ class _WNA16RequestUseLeaseManager:
             lease = _WNA16RequestUseLease(self, view)
             self._by_id[id(lease)] = lease
             object.__setattr__(view, "_request_use_lease", lease)
+            activation = object.__getattribute__(
+                view, "_controller_request_use_activation_capability"
+            )
+            if activation is not None:
+                if not callable(activation):
+                    self._by_id.pop(id(lease), None)
+                    object.__setattr__(view, "_request_use_lease", None)
+                    raise _lifecycle_error(
+                        "private WNA16 request pin activation is foreign", stale=True
+                    )
+                try:
+                    activation(lease)
+                except BaseException:
+                    # A failed pin activation leaves the view unbound so the
+                    # request never acquires an unpinned dispatch lease.
+                    self._by_id.pop(id(lease), None)
+                    object.__setattr__(view, "_request_use_lease", None)
+                    raise
             return view
 
     def acquire(self, view: WNA16GenerationView) -> _WNA16RequestUseLease:
@@ -444,6 +465,16 @@ class _WNA16RequestUseLeaseManager:
             )
 
     def _release(self, lease: _WNA16RequestUseLease) -> None:
+        capability = object.__getattribute__(
+            lease.view, "_controller_request_completion_capability"
+        )
+        if capability is not None:
+            if not callable(capability):
+                raise _lifecycle_error(
+                    "private WNA16 controller completion capability is foreign",
+                    stale=True,
+                )
+            capability(lease)
         lease.state = _WNA16RequestUseState.RELEASED
         self._by_id.pop(id(lease), None)
         lease.completion_event = None
@@ -569,6 +600,18 @@ class _WNA16RequestDrainAuthority:
     ) -> None:
         self._require_exact_proof(lease, proof)
         self._proofs.pop(id(lease), None)
+
+
+def _is_exact_request_use_lease(
+    view: WNA16GenerationView, lease: object
+) -> bool:
+    """True only for the one current request-use lease bound to this view."""
+    return (
+        isinstance(lease, _WNA16RequestUseLease)
+        and lease.view is view
+        and object.__getattribute__(view, "_request_use_lease") is lease
+        and lease.manager._by_id.get(id(lease)) is lease
+    )
 
 
 def acquire_private_wna16_request_use(
@@ -734,6 +777,13 @@ class _RevocablePrivateWNA16Provider:
                     stale=True,
                 )
             view = _bind_controller_wna16_slot_storage(view, self.capability)
+            if object.__getattribute__(view, "slot_map").is_cuda:
+                # CUDA-map authority is minted only for an already-private
+                # CUDA map; a CPU-map view cannot carry CUDA authority and
+                # remains dispatchable only through its content validation.
+                view = _bind_controller_wna16_cuda_map_authority(
+                    view, self.capability
+                )
             return self.registration._registration.request_use_manager.bind(view)
 
 
@@ -763,6 +813,11 @@ class PrivateWNA16ResidencyController:
         self._next_cpu_generation = 0
         self._retained_cpu_source_slots: dict[object, _WNA16CpuSourceSlotRetention] = {}
         self._cpu_source_slot_retention_queries: set[object] = set()
+        self._published_generation: WNA16GenerationView | None = None
+        self._published_cpu_slot_map: torch.Tensor | None = None
+        self._pending_cuda_generation_fills: dict[
+            int, tuple[_WNA16CpuGenerationTransaction, object]
+        ] = {}
         self._closed = False
 
     def __call__(
@@ -1488,6 +1543,30 @@ class PrivateWNA16ResidencyController:
                 raise _lifecycle_error("private WNA16 CPU control map is invalid")
             return candidate
 
+    def _current_resident_cpu_slot_map_locked(self) -> torch.Tensor | None:
+        """Full read-only map over current RESIDENT slots; caller holds lock."""
+        bank = self._canonical_cpu_bank
+        if bank is None or not self._slots:
+            return None
+        candidate = torch.full(
+            (bank.global_num_experts,), -1, dtype=torch.int32, device="cpu"
+        )
+        for slot_index, slot in enumerate(self._slots):
+            if slot.state is not _WNA16SlotState.RESIDENT:
+                continue
+            if slot.expert_id is None:
+                raise _lifecycle_error("private WNA16 current map is invalid")
+            candidate[slot.expert_id] = slot_index
+        values = candidate.tolist()
+        if (
+            not candidate.is_contiguous()
+            or any(value < -1 or value >= len(self._slots) for value in values)
+            or len({value for value in values if value >= 0})
+            != sum(value >= 0 for value in values)
+        ):
+            raise _lifecycle_error("private WNA16 current map is invalid")
+        return candidate
+
     def _validate_cuda_h2d_destination(
         self,
         reservation: _WNA16SlotReservation,
@@ -1761,6 +1840,15 @@ class PrivateWNA16ResidencyController:
                     return
             raise _lifecycle_error("private WNA16 logical resident is unavailable")
 
+    def _release_logical_resident_pin_for_test(self, expert_id: int) -> None:
+        """Release a CPU-only logical pin acquired by the test helper."""
+        with self._lifecycle_lock:
+            for slot in self._slots:
+                if slot.expert_id == expert_id and slot.pins > 0:
+                    slot.pins -= 1
+                    return
+            raise _lifecycle_error("private WNA16 logical resident pin is stale")
+
     @staticmethod
     def _snapshot_slot(slot: _WNA16LogicalSlot) -> _WNA16LogicalSlotSnapshot:
         return _WNA16LogicalSlotSnapshot(
@@ -1774,12 +1862,39 @@ class PrivateWNA16ResidencyController:
         self._slot_clock += 1
         slot.last_used = self._slot_clock
 
+    def _finalize_completed_cuda_generation_fills(self) -> None:
+        """Release retained CPU sources only after their recorded fill event queries true."""
+        with self._lifecycle_lock:
+            fills = tuple(self._pending_cuda_generation_fills.items())
+        for generation, (_, event) in fills:
+            try:
+                query = getattr(event, "query", None)
+                if not callable(query):
+                    raise _event_query_error("CUDA generation fill event is invalid")
+                complete = query()
+                if type(complete) is not bool:
+                    raise _event_query_error("CUDA generation fill event is invalid")
+            except Phase4UnsupportedError:
+                raise
+            except Exception as error:
+                raise _event_query_error("CUDA generation fill event query failed") from error
+            if complete:
+                with self._lifecycle_lock:
+                    current = self._pending_cuda_generation_fills.get(generation)
+                    if current is not None and current[1] is event:
+                        self._pending_cuda_generation_fills.pop(generation, None)
+
     def close(self) -> None:
         with self._lifecycle_lock:
             self._closed = True
+        self._finalize_completed_cuda_generation_fills()
         self._finalize_completed_cpu_source_slot_retentions()
         with self._lifecycle_lock:
-            if self._retained_cpu_source_slots:
+            if (
+                self._pending_cuda_generation_fills
+                or self._retained_cpu_source_slots
+                or any(slot.pins for slot in self._slots)
+            ):
                 raise _drain_incomplete_error()
             self._canonical_cpu_bank = None
             self._bound_routed_experts = None
@@ -1790,14 +1905,268 @@ class PrivateWNA16ResidencyController:
             self._cpu_generation_construction_rollbacks.clear()
             self._cpu_source_slot_retention_queries.clear()
 
+    def _bind_controller_request_use_capabilities(
+        self,
+        view: WNA16GenerationView,
+        pinned_slots: tuple[tuple[int, int], ...],
+    ) -> None:
+        """Attach exact request pin activation and one-shot completion closures.
+
+        ``pinned_slots`` is the exact generation-slot set ``(slot, expert_id)``
+        that this request's route references. The activation closure runs when
+        the request-use manager binds the request-local lease (before kernel
+        enqueue). The completion closure runs exactly once from that same
+        lease's release and only after its verified completion state.
+        """
+        with self._lifecycle_lock:
+            pinned = tuple(pinned_slots)
+            bank = self._canonical_cpu_bank
+            for slot_index, expert_id in pinned:
+                if type(slot_index) is not int or type(expert_id) is not int:
+                    raise _lifecycle_error("private WNA16 request pin is invalid")
+                if not 0 <= slot_index < len(self._slots):
+                    raise _lifecycle_error("private WNA16 request pin slot is invalid")
+                if bank is None or not 0 <= expert_id < bank.global_num_experts:
+                    raise _lifecycle_error(
+                        "private WNA16 request pin expert is invalid"
+                    )
+            activated = False
+            released = False
+
+            def activation(lease: object) -> None:
+                nonlocal activated
+                if activated or not _is_exact_request_use_lease(view, lease):
+                    raise _lifecycle_error(
+                        "private WNA16 request pin activation is foreign or stale",
+                        stale=True,
+                    )
+                with self._lifecycle_lock:
+                    if self._closed:
+                        raise _lifecycle_error(
+                            "private WNA16 request pin activation is stale", stale=True
+                        )
+                    for slot_index, expert_id in pinned:
+                        slot = self._slots[slot_index]
+                        if (
+                            slot.state is not _WNA16SlotState.RESIDENT
+                            or slot.expert_id != expert_id
+                        ):
+                            raise _lifecycle_error(
+                                "private WNA16 request pin slot is stale", stale=True
+                            )
+                    for slot_index, _ in pinned:
+                        self._slots[slot_index].pins += 1
+                activated = True
+
+            def completion(lease: object) -> None:
+                nonlocal released
+                if released:
+                    raise _lifecycle_error(
+                        "private WNA16 request completion is stale", stale=True
+                    )
+                if not _is_exact_request_use_lease(view, lease):
+                    raise _lifecycle_error(
+                        "private WNA16 request completion lease is foreign",
+                        stale=True,
+                    )
+                with self._lifecycle_lock:
+                    for slot_index, expert_id in pinned:
+                        slot = self._slots[slot_index]
+                        if slot.expert_id != expert_id or slot.pins <= 0:
+                            raise _lifecycle_error(
+                                "private WNA16 request completion pin is stale",
+                                stale=True,
+                            )
+                    for slot_index, _ in pinned:
+                        self._slots[slot_index].pins -= 1
+                released = True
+
+            object.__setattr__(
+                view, "_controller_request_use_activation_capability", activation
+            )
+            object.__setattr__(
+                view, "_controller_request_completion_capability", completion
+            )
+
+    def _reusable_controller_generation_view(
+        self, expert_ids: tuple[int, ...]
+    ) -> WNA16GenerationView | None:
+        """Return a fresh request-local view only when no copy is required.
+
+        Reuse is exact: the current resident slot map must still equal the
+        published generation's immutable CPU map and every requested expert
+        must already map to a valid slot. The published bundle and CUDA map
+        are immutable and shared; every reuse mints its own request-local
+        lease and capability closures.
+        """
+        with self._lifecycle_lock:
+            if (
+                self._closed
+                or self._published_generation is None
+                or self._published_cpu_slot_map is None
+            ):
+                return None
+            current = self._current_resident_cpu_slot_map_locked()
+            published_map = self._published_cpu_slot_map
+            if current is None or not torch.equal(current, published_map):
+                return None
+            if any(int(published_map[expert_id]) < 0 for expert_id in expert_ids):
+                return None
+            published = self._published_generation
+            bundle = object.__getattribute__(published, "bundle")
+            slot_map = object.__getattribute__(published, "slot_map")
+            generation = bundle.generation
+            view = WNA16GenerationView(
+                bundle=bundle,
+                slot_map=slot_map,
+                map_generation=object.__getattribute__(published, "map_generation"),
+                use_lease=WNA16UseLease(
+                    self._layer_id, generation, bundle, generation
+                ),
+            )
+            pinned_slots = tuple(
+                (int(published_map[expert_id]), expert_id)
+                for expert_id in expert_ids
+                if int(published_map[expert_id]) >= 0
+            )
+            self._bind_controller_request_use_capabilities(view, pinned_slots)
+            self._published_generation = view
+            return view
+
+    def _publish_fresh_controller_generation_view(
+        self, *, expert_ids: tuple[int, ...], device: torch.device
+    ) -> WNA16GenerationView:
+        """Plan, fill, and commit one complete immutable CUDA generation.
+
+        Every expert row referenced by the candidate map is copied from the
+        detached CPU bank into the fresh bundle, so retained resident rows and
+        newly reserved rows are both complete before the immutable map/view is
+        published. No device-wide synchronization is introduced.
+        """
+        transaction = self._prepare_controller_private_cpu_generation_transaction(
+            expert_ids=expert_ids
+        )
+        try:
+            operands = transaction.operands
+            candidate = transaction.candidate_cpu_slot_map
+            slots = len(self._slots)
+
+            def allocate(source: torch.Tensor | None) -> torch.Tensor | None:
+                if source is None:
+                    return None
+                return torch.empty(
+                    (slots, *source.shape[1:]), device=device, dtype=source.dtype
+                )
+
+            w13 = allocate(operands.w13_weight_packed)
+            w2 = allocate(operands.w2_weight_packed)
+            w13_scale = allocate(operands.w13_weight_scale)
+            w2_scale = allocate(operands.w2_weight_scale)
+            w13_zero = allocate(operands.w13_weight_zero_point)
+            w2_zero = allocate(operands.w2_weight_zero_point)
+            assert w13 is not None and w2 is not None
+            assert w13_scale is not None and w2_scale is not None
+            slot_map = torch.empty(
+                (candidate.shape[0],), device=device, dtype=torch.int32
+            )
+            stream = torch.cuda.Stream(device=device)
+            fill_done = torch.cuda.Event(enable_timing=False)
+            with stream:
+                for expert_id, slot in enumerate(candidate.tolist()):
+                    if slot < 0:
+                        continue
+                    w13[slot].copy_(
+                        operands.w13_weight_packed[expert_id], non_blocking=True
+                    )
+                    w2[slot].copy_(
+                        operands.w2_weight_packed[expert_id], non_blocking=True
+                    )
+                    w13_scale[slot].copy_(
+                        operands.w13_weight_scale[expert_id], non_blocking=True
+                    )
+                    w2_scale[slot].copy_(
+                        operands.w2_weight_scale[expert_id], non_blocking=True
+                    )
+                    if (
+                        w13_zero is not None
+                        and operands.w13_weight_zero_point is not None
+                    ):
+                        w13_zero[slot].copy_(
+                            operands.w13_weight_zero_point[expert_id],
+                            non_blocking=True,
+                        )
+                    if (
+                        w2_zero is not None
+                        and operands.w2_weight_zero_point is not None
+                    ):
+                        w2_zero[slot].copy_(
+                            operands.w2_weight_zero_point[expert_id],
+                            non_blocking=True,
+                        )
+                slot_map.copy_(candidate, non_blocking=True)
+                fill_done.record(stream)
+            torch.cuda.current_stream(device).wait_event(fill_done)
+            bundle = WNA16ExpertBundle(
+                schema_version=1, backend="triton", layer_id=self._layer_id,
+                global_num_experts=slot_map.shape[0], slot_count=slots,
+                generation=transaction.generation, quant_type="W4A16", num_bits=4,
+                symmetric=True, group_size=32, act_order=False, w13=w13, w2=w2,
+                w13_scale=w13_scale, w2_scale=w2_scale, w13_zero=w13_zero, w2_zero=w2_zero,
+            )
+            view = WNA16GenerationView(
+                bundle=bundle, slot_map=slot_map, map_generation=transaction.generation,
+                use_lease=WNA16UseLease(
+                    self._layer_id, transaction.generation, bundle,
+                    transaction.generation,
+                ),
+            )
+            with self._lifecycle_lock:
+                for reservation in transaction.reservations:
+                    self._reservations.pop(reservation.token)
+                    self._slots[reservation.slot] = _WNA16LogicalSlot(
+                        _WNA16SlotState.RESIDENT, reservation.expert_id, 0,
+                        self._slot_clock,
+                    )
+                pinned_slots = tuple(
+                    (int(candidate[expert_id]), expert_id)
+                    for expert_id in expert_ids
+                    if int(candidate[expert_id]) >= 0
+                )
+                self._bind_controller_request_use_capabilities(view, pinned_slots)
+                self._published_generation = view
+                self._published_cpu_slot_map = candidate.clone()
+                self._pending_cuda_generation_fills[transaction.generation] = (
+                    transaction, fill_done
+                )
+            return view
+        except BaseException:
+            with suppress(BaseException):
+                self._rollback_controller_private_cpu_generation_transaction(transaction)
+            raise
+
     def _request_generation_view(
         self,
         *,
         topk_ids: torch.Tensor,
         topk_weights: torch.Tensor,
     ) -> WNA16GenerationView:
-        del topk_ids, topk_weights
-        raise _lifecycle_error("CPU-to-GPU private WNA16 handoff is not implemented")
+        """Fill/publish or reuse one immutable private CUDA generation."""
+        del topk_weights
+        if not topk_ids.is_cuda or topk_ids.dtype is not torch.int32:
+            raise _lifecycle_error("private WNA16 route IDs must be CUDA int32")
+        expert_ids = tuple(
+            dict.fromkeys(
+                int(item) for item in topk_ids.detach().flatten().cpu().tolist()
+            )
+        )
+        if not expert_ids:
+            raise _lifecycle_error("private WNA16 route has no selected experts")
+        reused = self._reusable_controller_generation_view(expert_ids)
+        if reused is not None:
+            return reused
+        return self._publish_fresh_controller_generation_view(
+            expert_ids=expert_ids, device=topk_ids.device
+        )
 
 
 def register_private_wna16_provider_factory(

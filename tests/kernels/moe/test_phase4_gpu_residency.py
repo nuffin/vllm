@@ -29,17 +29,26 @@ from vllm.model_executor.layers.fused_moe.expert_residency import (
     _bind_controller_wna16_slot_storage,
     _new_controller_wna16_stable_slot_capability,
     _private_wna16_dispatch_operands,
+    validate_private_wna16_dispatch_inputs,
     validate_wna16_generation_view,
 )
 from vllm.model_executor.layers.fused_moe.modular_kernel import (
     FusedMoEKernelModularImpl,
 )
-from vllm.model_executor.layers.fused_moe.oracle.int_wna16 import WNA16MoEBackend
+from vllm.model_executor.layers.fused_moe.activation import MoEActivation
+from vllm.model_executor.layers.fused_moe.experts.triton_moe import TritonWNA16Experts
+from vllm.model_executor.layers.fused_moe.oracle.int_wna16 import (
+    WNA16MoEBackend,
+    make_wna16_moe_kernel,
+    make_wna16_moe_quant_config,
+)
 from vllm.model_executor.layers.fused_moe.private_wna16_provider import (
     PrivateWNA16ProviderBindingRequest,
     PrivateWNA16ResidencyController,
+    _WNA16RequestUseLeaseManager,
     _WNA16RequestUseState,
     _WNA16SlotPlanStatus,
+    _WNA16SlotState,
     _WNA16StagedCudaSlot,
     acquire_private_wna16_request_use,
     begin_private_wna16_request_enqueue,
@@ -57,6 +66,8 @@ from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tenso
 from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors_moe.compressed_tensors_moe_wna16_rdna3 import (  # noqa: E501
     CompressedTensorsWNA16RDNA3MoEMethod,
 )
+from tests.kernels.moe.utils import make_dummy_moe_config
+from vllm.v1.worker.workspace import init_workspace_manager
 
 
 def complete_bundle() -> PostConversionExpertBundle:
@@ -589,6 +600,7 @@ def test_cpu_slot_planner_pinned_or_staged_slots_fall_back_without_mutation():
         assert plan.reservation is None
         assert controller._slots[0] == before
         assert controller._slot_clock == before_clock
+        controller._release_logical_resident_pin_for_test(1)
     finally:
         registration.close()
 
@@ -654,6 +666,7 @@ def test_cpu_slot_planner_late_pin_restores_victim_without_eviction():
         fallback = controller._plan_slot_transaction(2)
         assert fallback.status is _WNA16SlotPlanStatus.FALLBACK
         assert fallback.slot is None
+        controller._release_logical_resident_pin_for_test(1)
     finally:
         registration.close()
 
@@ -3025,6 +3038,29 @@ def _staging_controller():
     return controller
 
 
+def _abi_staging_controller():
+    """ABI-valid canonical W4A16 bank for real CUDA validation/dispatch tests."""
+    controller = PrivateWNA16ResidencyController(3, slot_count=2)
+    layer = SimpleNamespace(
+        global_num_experts=4,
+        use_ep=False,
+        w13_weight_packed=torch.arange(4 * 64 * 16, dtype=torch.uint8).reshape(4, 64, 16),
+        w2_weight_packed=torch.arange(4 * 32 * 16, dtype=torch.uint8).reshape(4, 32, 16),
+        w13_weight_scale=torch.ones(4, 64, 1),
+        w2_weight_scale=torch.ones(4, 32, 1),
+        w13_weight_zero_point=None,
+        w2_weight_zero_point=None,
+    )
+    layer.w13_weight = layer.w13_weight_packed
+    layer.w2_weight = layer.w2_weight_packed
+    controller(PrivateWNA16ProviderBindingRequest(layer_id=3, routed_experts=layer))
+    controller.capture_post_conversion(
+        layer=cast(RoutedExperts, layer), backend=WNA16MoEBackend.TRITON, num_bits=4,
+        symmetric=True, group_size=32, act_order=False,
+    )
+    return controller
+
+
 def test_private_cuda_slot_staging_cpu_contract_is_fenced_but_unpublished():
     class CompleteEvent:
         def __init__(self):
@@ -3049,7 +3085,7 @@ def test_private_cuda_slot_staging_cpu_contract_is_fenced_but_unpublished():
     assert torch.equal(staged.slot_map, original_map)
     assert len(controller._retained_cpu_source_slots) == 1
     assert controller._slots[0].state.name == "RESERVED_EMPTY"
-    with pytest.raises(Phase4UnsupportedError, match="not implemented"):
+    with pytest.raises(Phase4UnsupportedError, match="CUDA int32"):
         controller._request_generation_view(
             topk_ids=torch.tensor([[0]], dtype=torch.int32),
             topk_weights=torch.tensor([[1.0]]),
@@ -3757,5 +3793,453 @@ def test_private_wna16_cuda_abi_preflight_only():
             transaction
         )
         assert controller._slots[0].state.name == "ABSENT"
+    finally:
+        controller.close()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")
+def test_request_generation_view_publishes_complete_cuda_generation_for_route():
+    """Real CUDA RED: selected CPU-bank experts publish one complete private view."""
+    controller = _staging_controller()
+    topk_ids = torch.tensor([[0, 1]], device="cuda", dtype=torch.int32)
+    topk_weights = torch.tensor([[0.5, 0.5]], device="cuda")
+
+    try:
+        view = controller._request_generation_view(
+            topk_ids=topk_ids, topk_weights=topk_weights
+        )
+        assert view.bundle.w13.is_cuda
+        assert view.bundle.w2.is_cuda
+        assert view.slot_map.is_cuda
+        assert view.slot_map.dtype is torch.int32
+        assert view.slot_map.tolist() == [0, 1, -1, -1]
+    finally:
+        controller.close()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")
+def test_registered_controller_publishes_authorized_cuda_operands_and_request_lease():
+    """Registered provider must mint both CUDA-map authority and a use lease."""
+    controller = _abi_staging_controller()
+    registration = register_private_wna16_provider_factory(controller)
+    layer = controller._bound_routed_experts
+    assert layer is not None
+    setattr(
+        layer,
+        "set_private_wna16_generation_view_provider",
+        lambda provider, *, layer_id: setattr(
+            layer, "_private_wna16_generation_view_provider", provider
+        ),
+    )
+    try:
+        bind_private_wna16_generation_view_provider(layer_id=3, routed_experts=layer)
+        provider = layer._private_wna16_generation_view_provider
+        assert provider is not None
+        view = provider(
+            topk_ids=torch.tensor([[0, 1]], device="cuda", dtype=torch.int32),
+            topk_weights=torch.tensor([[0.5, 0.5]], device="cuda"),
+        )
+        assert view is not None
+        operands = _private_wna16_dispatch_operands(view)
+        assert operands.slot_map.is_cuda
+        validate_private_wna16_dispatch_inputs(
+            view,
+            hidden_states=torch.ones((1, 2), device="cuda"),
+            topk_ids=torch.tensor([[0, 1]], device="cuda", dtype=torch.int32),
+            topk_weights=torch.tensor([[0.5, 0.5]], device="cuda"),
+            global_num_experts=4,
+            layer_id=3,
+        )
+        assert object.__getattribute__(view, "_request_use_lease") is not None
+    finally:
+        registration.close()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")
+def test_controller_private_wna16_real_triton_launch_preserves_router_inputs():
+    """Controller slots must execute via concrete Triton WNA16 kernel unchanged."""
+    controller = _abi_staging_controller()
+    registration = register_private_wna16_provider_factory(controller)
+    layer = controller._bound_routed_experts
+    assert layer is not None
+    setattr(
+        layer,
+        "set_private_wna16_generation_view_provider",
+        lambda provider, *, layer_id: setattr(
+            layer, "_private_wna16_generation_view_provider", provider
+        ),
+    )
+    try:
+        bind_private_wna16_generation_view_provider(layer_id=3, routed_experts=layer)
+        provider = layer._private_wna16_generation_view_provider
+        assert provider is not None
+        topk_ids = torch.tensor([[0, 1]], device="cuda", dtype=torch.int32)
+        topk_weights = torch.tensor([[0.5, 0.5]], device="cuda", dtype=torch.bfloat16)
+        ids_before, weights_before = topk_ids.clone(), topk_weights.clone()
+        view = provider(topk_ids=topk_ids, topk_weights=topk_weights)
+        operands = _private_wna16_dispatch_operands(view)
+        config = make_dummy_moe_config(
+            num_experts=4, num_local_experts=2, experts_per_token=2,
+            hidden_dim=32, intermediate_size=32, in_dtype=torch.bfloat16,
+            activation=MoEActivation.SILU,
+        )
+        quant = make_wna16_moe_quant_config(
+            operands.w13_scale, operands.w2_scale, 32, 4
+        )
+        kernel = make_wna16_moe_kernel(
+            quant, config, TritonWNA16Experts, WNA16MoEBackend.TRITON
+        )
+        hidden = torch.randn((1, 32), device="cuda", dtype=torch.bfloat16)
+        init_workspace_manager(hidden.device)
+        result = kernel.apply_private_wna16(
+            hidden, operands.w13, operands.w2, operands.w13_scale,
+            operands.w2_scale, None, None, topk_weights, topk_ids,
+            MoEActivation.SILU, 4, operands.slot_map, False,
+        )
+        assert result.shape == hidden.shape
+        assert result.is_cuda
+        assert torch.equal(topk_ids, ids_before)
+        assert torch.equal(topk_weights, weights_before)
+    finally:
+        registration.close()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")
+def test_request_completion_invokes_exact_controller_private_release_capability():
+    """A completed request lease releases only its bound controller capability."""
+    calls: list[object] = []
+    view, _ = cuda_private_view()
+    object.__setattr__(
+        view, "_controller_request_completion_capability", lambda received: calls.append(received)
+    )
+    manager = _WNA16RequestUseLeaseManager()
+    manager.bind(view)
+    lease = acquire_private_wna16_request_use(view)
+    assert lease is not None
+    mark_private_wna16_request_dispatched(lease)
+    begin_private_wna16_request_enqueue(lease)
+    event = SimpleNamespace(query=lambda: True)
+    release_private_wna16_request_use_pending(lease, event)
+    assert calls == []
+    manager.finalize_completed()
+    assert calls == [lease]
+
+
+def test_controller_close_quarantines_incomplete_generation_fill_until_retry():
+    """Post-copy CPU bank remains owned until the recorded fill event drains."""
+    controller = _abi_staging_controller()
+    try:
+        controller._request_generation_view(
+            topk_ids=torch.tensor([[0, 1]], device="cuda", dtype=torch.int32),
+            topk_weights=torch.tensor([[0.5, 0.5]], device="cuda"),
+        )
+        assert controller._pending_cuda_generation_fills
+        class ControlledEvent:
+            complete = False
+            def query(self):
+                return self.complete
+        generation, (transaction, _) = next(
+            iter(controller._pending_cuda_generation_fills.items())
+        )
+        event = ControlledEvent()
+        controller._pending_cuda_generation_fills[generation] = (transaction, event)
+        with pytest.raises(Phase4UnsupportedError) as error:
+            controller.close()
+        assert error.value.category is Phase4FailureCategory.DRAIN_INCOMPLETE
+        assert controller._pending_cuda_generation_fills
+        assert controller._canonical_cpu_bank is not None
+        event.complete = True
+        controller.close()
+        assert controller._canonical_cpu_bank is None
+    finally:
+        if not controller._closed:
+            controller.close()
+
+
+def _seeded_request_controller():
+    """CPU controller with two resident slots for request pin/lease tests."""
+    controller = _staging_controller()
+    controller._seed_logical_resident_for_test(0, 0, last_used=1)
+    controller._seed_logical_resident_for_test(1, 1, last_used=2)
+    return controller
+
+
+def _pin_bound_request_view(controller, *, pinned=((0, 0), (1, 1))):
+    """Mint request capabilities, bind one manager lease, and return artifacts."""
+    view = private_view()
+    controller._bind_controller_request_use_capabilities(view, pinned)
+    manager = _WNA16RequestUseLeaseManager()
+    manager.bind(view)
+    return view, manager
+
+
+def test_request_bind_activates_pin_on_exact_resident_generation_slots():
+    """Binding a request lease pins the exact generation slots before enqueue."""
+    controller = _seeded_request_controller()
+    try:
+        view = private_view()
+        controller._bind_controller_request_use_capabilities(view, ((0, 0), (1, 1)))
+        manager = _WNA16RequestUseLeaseManager()
+        assert controller._slots[0].pins == 0
+        assert controller._slots[1].pins == 0
+        manager.bind(view)
+        assert controller._slots[0].pins == 1
+        assert controller._slots[1].pins == 1
+        assert controller._slots[0].state is _WNA16SlotState.RESIDENT
+        lease = object.__getattribute__(view, "_request_use_lease")
+        assert lease is not None
+        lease.manager.cancel_issued(lease)
+        assert controller._slots[0].pins == 0
+        assert controller._slots[1].pins == 0
+    finally:
+        if not controller._closed:
+            controller.close()
+
+
+def test_completed_request_lease_releases_exact_generation_pins_only_once():
+    """Event completion releases pins; a replay or foreign lease is stale."""
+    controller = _seeded_request_controller()
+    try:
+        view, manager = _pin_bound_request_view(controller)
+        lease = acquire_private_wna16_request_use(view)
+        assert lease is not None
+        mark_private_wna16_request_dispatched(lease)
+        begin_private_wna16_request_enqueue(lease)
+        event = SimpleNamespace(query=lambda: True)
+        release_private_wna16_request_use_pending(lease, event)
+        assert controller._slots[0].pins == 1
+        assert controller._slots[1].pins == 1
+        manager.finalize_completed()
+        assert lease.state is _WNA16RequestUseState.RELEASED
+        assert controller._slots[0].pins == 0
+        assert controller._slots[1].pins == 0
+        completion = object.__getattribute__(
+            view, "_controller_request_completion_capability"
+        )
+        with pytest.raises(Phase4UnsupportedError) as error:
+            completion(lease)
+        assert error.value.category is Phase4FailureCategory.STALE_LEASE
+        assert controller._slots[0].pins == 0
+        assert controller._slots[1].pins == 0
+    finally:
+        if not controller._closed:
+            controller.close()
+
+
+def test_request_completion_rejects_foreign_lease_and_leaves_pins_owned():
+    """Only the exact same-lease release may unpin the generation slots."""
+    controller = _seeded_request_controller()
+    foreign_controller = _seeded_request_controller()
+    try:
+        view, manager = _pin_bound_request_view(controller)
+        foreign_view = private_view()
+        foreign_manager = _WNA16RequestUseLeaseManager()
+        foreign_manager.bind(foreign_view)
+        foreign_lease = object.__getattribute__(foreign_view, "_request_use_lease")
+        assert foreign_lease is not None
+        completion = object.__getattribute__(
+            view, "_controller_request_completion_capability"
+        )
+        with pytest.raises(Phase4UnsupportedError) as error:
+            completion(foreign_lease)
+        assert error.value.category is Phase4FailureCategory.STALE_LEASE
+        assert controller._slots[0].pins == 1
+        assert controller._slots[1].pins == 1
+        lease = acquire_private_wna16_request_use(view)
+        assert lease is not None
+        mark_private_wna16_request_dispatched(lease)
+        begin_private_wna16_request_enqueue(lease)
+        event = SimpleNamespace(query=lambda: True)
+        release_private_wna16_request_use_pending(lease, event)
+        manager.finalize_completed()
+        assert controller._slots[0].pins == 0
+        assert controller._slots[1].pins == 0
+    finally:
+        if not controller._closed:
+            controller.close()
+        if not foreign_controller._closed:
+            foreign_controller.close()
+
+
+def test_controller_close_rejects_while_request_generation_slots_are_pinned():
+    """Close quarantines pinned generation slots until the request drains."""
+    controller = _seeded_request_controller()
+    view, manager = _pin_bound_request_view(controller)
+    lease = acquire_private_wna16_request_use(view)
+    assert lease is not None
+    mark_private_wna16_request_dispatched(lease)
+    begin_private_wna16_request_enqueue(lease)
+    controlled = SimpleNamespace(complete=False, query=lambda: controlled.complete)
+    release_private_wna16_request_use_pending(lease, controlled)
+    try:
+        with pytest.raises(Phase4UnsupportedError) as error:
+            controller.close()
+        assert error.value.category is Phase4FailureCategory.DRAIN_INCOMPLETE
+        assert controller._canonical_cpu_bank is not None
+        assert controller._slots[0].pins == 1
+        controlled.complete = True
+        manager.finalize_completed()
+        assert controller._slots[0].pins == 0
+        assert controller._slots[1].pins == 0
+        controller.close()
+        assert controller._canonical_cpu_bank is None
+    finally:
+        if not controller._closed:
+            controller.close()
+
+
+def _registered_abi_provider(slot_count: int = 2):
+    """Registered real-CUDA provider over the ABI-valid canonical bank."""
+    controller = PrivateWNA16ResidencyController(3, slot_count=slot_count)
+    layer = SimpleNamespace(
+        global_num_experts=4,
+        use_ep=False,
+        w13_weight_packed=torch.arange(4 * 64 * 16, dtype=torch.uint8).reshape(4, 64, 16),
+        w2_weight_packed=torch.arange(4 * 32 * 16, dtype=torch.uint8).reshape(4, 32, 16),
+        w13_weight_scale=torch.ones(4, 64, 1),
+        w2_weight_scale=torch.ones(4, 32, 1),
+        w13_weight_zero_point=None,
+        w2_weight_zero_point=None,
+    )
+    layer.w13_weight = layer.w13_weight_packed
+    layer.w2_weight = layer.w2_weight_packed
+    registration = register_private_wna16_provider_factory(controller)
+    controller(
+        PrivateWNA16ProviderBindingRequest(layer_id=3, routed_experts=layer)
+    )
+    controller.capture_post_conversion(
+        layer=cast(RoutedExperts, layer), backend=WNA16MoEBackend.TRITON, num_bits=4,
+        symmetric=True, group_size=32, act_order=False,
+    )
+    layer.set_private_wna16_generation_view_provider = (
+        lambda provider, *, layer_id: setattr(
+            layer, "_private_wna16_generation_view_provider", provider
+        )
+    )
+    bind_private_wna16_generation_view_provider(layer_id=3, routed_experts=layer)
+    provider = layer._private_wna16_generation_view_provider
+    assert provider is not None
+    return controller, registration, provider
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")
+def test_controller_publication_mints_exact_request_capabilities():
+    """Controller publication binds activation and one-shot completion closures."""
+    controller = _abi_staging_controller()
+    try:
+        view = controller._request_generation_view(
+            topk_ids=torch.tensor([[0, 1]], device="cuda", dtype=torch.int32),
+            topk_weights=torch.tensor([[0.5, 0.5]], device="cuda"),
+        )
+        activation = object.__getattribute__(
+            view, "_controller_request_use_activation_capability"
+        )
+        completion = object.__getattribute__(
+            view, "_controller_request_completion_capability"
+        )
+        assert callable(activation)
+        assert callable(completion)
+    finally:
+        controller.close()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")
+def test_warm_same_route_reuses_immutable_generation_without_copy():
+    """A repeated same-route request gets a fresh lease over the same bundle."""
+    controller = _abi_staging_controller()
+    try:
+        topk_ids = torch.tensor([[0, 1]], device="cuda", dtype=torch.int32)
+        topk_weights = torch.tensor([[0.5, 0.5]], device="cuda")
+        view_one = controller._request_generation_view(
+            topk_ids=topk_ids, topk_weights=topk_weights
+        )
+        generation_before = controller._next_cpu_generation
+        fills_before = len(controller._pending_cuda_generation_fills)
+        bundle_one = object.__getattribute__(view_one, "bundle")
+        map_one = object.__getattribute__(view_one, "slot_map")
+        lease_one = object.__getattribute__(view_one, "use_lease")
+        view_two = controller._request_generation_view(
+            topk_ids=topk_ids, topk_weights=topk_weights
+        )
+        assert view_two is not view_one
+        assert object.__getattribute__(view_two, "bundle") is bundle_one
+        # The view dataclass snapshots its CUDA map at construction, so a warm
+        # reuse preserves the immutable map content rather than tensor identity.
+        assert torch.equal(
+            object.__getattribute__(view_two, "slot_map"), map_one
+        )
+        assert view_two.map_generation == view_one.map_generation
+        assert object.__getattribute__(view_two, "use_lease") is not lease_one
+        assert controller._next_cpu_generation == generation_before
+        assert len(controller._pending_cuda_generation_fills) == fills_before
+    finally:
+        controller.close()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")
+def test_inflight_request_pins_slot_and_rejects_replacement_until_release():
+    """Capacity-one route rejects eviction while pinned, then LRU replaces."""
+    controller, registration, provider = _registered_abi_provider(slot_count=1)
+    topk_one = torch.tensor([[0, 0]], device="cuda", dtype=torch.int32)
+    topk_two = torch.tensor([[1, 1]], device="cuda", dtype=torch.int32)
+    weights = torch.tensor([[0.5, 0.5]], device="cuda")
+    try:
+        view_one = provider(topk_ids=topk_one, topk_weights=weights)
+        assert controller._slots[0].expert_id == 0
+        assert controller._slots[0].pins == 1
+        lease = acquire_private_wna16_request_use(view_one)
+        assert lease is not None
+        mark_private_wna16_request_dispatched(lease)
+        begin_private_wna16_request_enqueue(lease)
+        with pytest.raises(Phase4UnsupportedError) as error:
+            provider(topk_ids=topk_two, topk_weights=weights)
+        assert "insufficient capacity" in str(error.value)
+        assert controller._slots[0].expert_id == 0
+        event = SimpleNamespace(query=lambda: True)
+        release_private_wna16_request_use_pending(lease, event)
+        view_two = provider(topk_ids=topk_two, topk_weights=weights)
+        assert controller._slots[0].expert_id == 1
+        assert controller._slots[0].pins == 1
+        assert view_two.slot_map.tolist() == [-1, 0, -1, -1]
+    finally:
+        registration.close()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")
+def test_pre_publication_failure_rolls_back_and_restores_old_publication():
+    """A failed fresh fill never replaces the prior immutable publication."""
+    controller = _abi_staging_controller()
+    try:
+        topk_one = torch.tensor([[0, 1]], device="cuda", dtype=torch.int32)
+        topk_two = torch.tensor([[2, 3]], device="cuda", dtype=torch.int32)
+        weights = torch.tensor([[0.5, 0.5]], device="cuda")
+        view_one = controller._request_generation_view(
+            topk_ids=topk_one, topk_weights=weights
+        )
+        slots_before = [replace(slot) for slot in controller._slots]
+        published_before = controller._published_generation
+        map_before = controller._published_cpu_slot_map
+        assert map_before is not None
+        with (
+            patch(
+                "torch.cuda.Event",
+                side_effect=RuntimeError("injected fill failure"),
+            ),
+            pytest.raises(RuntimeError, match="injected fill failure"),
+        ):
+            controller._request_generation_view(
+                topk_ids=topk_two, topk_weights=weights
+            )
+        assert controller._published_generation is published_before
+        assert controller._published_cpu_slot_map is not None
+        assert torch.equal(controller._published_cpu_slot_map, map_before)
+        assert controller._slots == slots_before
+        # The restored publication is still usable for the same route.
+        view_again = controller._request_generation_view(
+            topk_ids=topk_one, topk_weights=weights
+        )
+        assert object.__getattribute__(view_again, "bundle") is object.__getattribute__(
+            view_one, "bundle"
+        )
     finally:
         controller.close()

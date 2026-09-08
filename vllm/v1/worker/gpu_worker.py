@@ -496,6 +496,23 @@ class Worker(WorkerBase):
         controller = None
         layer_id = self.vllm_config.model_config.private_wna16_residency_layer
         if layer_id is not None:
+            slot_count = getattr(
+                self.vllm_config.model_config,
+                "private_wna16_residency_slot_count",
+                None,
+            )
+            if (
+                not getattr(
+                    self.vllm_config.model_config,
+                    "private_wna16_residency_test_only",
+                    False,
+                )
+                or type(slot_count) is not int
+                or slot_count <= 0
+            ):
+                raise RuntimeError(
+                    "private WNA16 residency requires a test-only fixed slot count"
+                )
             if getattr(self, "_private_wna16_provider_registration", None) is not None:
                 raise RuntimeError(
                     "private WNA16 residency is already registered for this worker"
@@ -505,7 +522,9 @@ class Worker(WorkerBase):
                 register_private_wna16_provider_factory,
             )
 
-            controller = PrivateWNA16ResidencyController(layer_id)
+            controller = PrivateWNA16ResidencyController(
+                layer_id, slot_count=slot_count
+            )
             registration = register_private_wna16_provider_factory(controller)
         try:
             with (

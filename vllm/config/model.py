@@ -245,6 +245,10 @@ class ModelConfig:
     flexibility."""
     private_wna16_residency_layer: int | None = Field(default=None, ge=0)
     """Opt-in Qwen3 WNA16 private-dispatch layer. ``None`` disables it."""
+    private_wna16_residency_test_only: bool = False
+    """Allow the private selector only with the explicit test environment guard."""
+    private_wna16_residency_slot_count: int | None = Field(default=None, ge=1)
+    """Fixed private CUDA slot count required by the test-only selector."""
     enable_return_routed_experts: bool = False
     """Whether to return routed experts."""
     return_sampling_mask: bool = False
@@ -933,9 +937,28 @@ class ModelConfig:
     def validate_model_config_after(self: "ModelConfig") -> "ModelConfig":
         """Called after __post_init__"""
         if self.private_wna16_residency_layer is not None:
+            if not (
+                self.private_wna16_residency_test_only
+                and envs.VLLM_PRIVATE_WNA16_RESIDENCY_TEST_ONLY
+            ):
+                raise ValueError(
+                    "--private-wna16-residency-layer is experimental and unavailable: "
+                    "CPU-to-GPU private WNA16 residency handoff is not implemented."
+                )
+            if self.private_wna16_residency_slot_count is None:
+                raise ValueError(
+                    "private WNA16 test-only residency requires a fixed slot count"
+                )
+            if not self.enforce_eager:
+                raise ValueError(
+                    "private WNA16 test-only residency requires --enforce-eager"
+                )
+        elif (
+            self.private_wna16_residency_test_only
+            or self.private_wna16_residency_slot_count is not None
+        ):
             raise ValueError(
-                "--private-wna16-residency-layer is experimental and unavailable: "
-                "CPU-to-GPU private WNA16 residency handoff is not implemented."
+                "private WNA16 test-only residency requires a selected layer"
             )
         if not isinstance(self.tokenizer, str):
             raise ValueError(

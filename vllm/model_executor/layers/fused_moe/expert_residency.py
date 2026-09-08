@@ -887,6 +887,17 @@ class WNA16GenerationView(_WeakrefableWNA16GenerationView):
     _request_use_lease: object | None = field(
         default=None, init=False, repr=False, compare=False
     )
+    # Controller-private one-shot release capability, bound after generation
+    # publication and invoked only by the request-use manager's exact lease.
+    _controller_request_completion_capability: object | None = field(
+        default=None, init=False, repr=False, compare=False
+    )
+    # Controller-private request activation capability, bound after generation
+    # publication and invoked exactly once when the request-use manager binds
+    # the request-local lease before kernel enqueue.
+    _controller_request_use_activation_capability: object | None = field(
+        default=None, init=False, repr=False, compare=False
+    )
 
     def __getattribute__(self, name: str) -> object:
         value = object.__getattribute__(self, name)

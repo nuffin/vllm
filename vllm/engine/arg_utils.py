@@ -573,6 +573,12 @@ class EngineArgs:
     private_wna16_residency_layer: int | None = (
         ModelConfig.private_wna16_residency_layer
     )
+    private_wna16_residency_test_only: bool = (
+        ModelConfig.private_wna16_residency_test_only
+    )
+    private_wna16_residency_slot_count: int | None = (
+        ModelConfig.private_wna16_residency_slot_count
+    )
     disable_custom_all_reduce: bool = ParallelConfig.disable_custom_all_reduce
     language_model_only: bool = MultiModalConfig.language_model_only
     limit_mm_per_prompt: dict[str, int | dict[str, int]] = get_field(
@@ -891,6 +897,14 @@ class EngineArgs:
         model_group.add_argument(
             "--private-wna16-residency-layer",
             **model_kwargs["private_wna16_residency_layer"],
+        )
+        model_group.add_argument(
+            "--private-wna16-residency-test-only",
+            **model_kwargs["private_wna16_residency_test_only"],
+        )
+        model_group.add_argument(
+            "--private-wna16-residency-slot-count",
+            **model_kwargs["private_wna16_residency_slot_count"],
         )
         model_group.add_argument(
             "--enable-return-routed-experts",
@@ -1801,6 +1815,8 @@ class EngineArgs:
             allow_deprecated_quantization=self.allow_deprecated_quantization,
             enforce_eager=self.enforce_eager,
             private_wna16_residency_layer=self.private_wna16_residency_layer,
+            private_wna16_residency_test_only=self.private_wna16_residency_test_only,
+            private_wna16_residency_slot_count=self.private_wna16_residency_slot_count,
             enable_return_routed_experts=self.enable_return_routed_experts,
             return_sampling_mask=self.return_sampling_mask,
             max_logprobs=self.max_logprobs,

@@ -1,5 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import json
+
 import pytest
 from pydantic import ValidationError
 
@@ -28,6 +30,46 @@ def test_private_wna16_residency_option_is_explicitly_unavailable():
         EngineArgs(
             **engine_args, private_wna16_residency_layer=-1
         ).create_engine_config()
+
+
+def test_private_wna16_residency_test_only_gate_requires_explicit_guard(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+):
+    """A private selector remains unavailable without the test-only dual gate."""
+    (tmp_path / "config.json").write_text(
+        json.dumps(
+            {
+                "architectures": ["LlamaForCausalLM"],
+                "hidden_size": 64,
+                "intermediate_size": 128,
+                "max_position_embeddings": 128,
+                "model_type": "llama",
+                "num_attention_heads": 1,
+                "num_hidden_layers": 1,
+                "num_key_value_heads": 1,
+                "vocab_size": 128,
+            }
+        )
+    )
+    engine_args = {
+        "model": str(tmp_path),
+        "trust_remote_code": False,
+        "enforce_eager": True,
+        "fail_on_environ_validation": True,
+        "private_wna16_residency_layer": 0,
+        "private_wna16_residency_test_only": True,
+        "private_wna16_residency_slot_count": 8,
+    }
+
+    with pytest.raises(ValidationError, match="experimental and unavailable"):
+        EngineArgs(**engine_args).create_engine_config()
+
+    monkeypatch.setenv("VLLM_PRIVATE_WNA16_RESIDENCY_TEST_ONLY", "1")
+    config = EngineArgs(**engine_args).create_engine_config()
+    assert config.model_config.private_wna16_residency_layer == 0
+    assert config.model_config.private_wna16_residency_test_only is True
+    assert config.model_config.private_wna16_residency_slot_count == 8
 
 
 def test_cuda_empty_vs_unset_configs(monkeypatch: pytest.MonkeyPatch):
