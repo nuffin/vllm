@@ -1220,10 +1220,10 @@ def validate_wna16_generation_view(
             Phase4FailureCategory.VALIDATION,
             "packed WNA16 weights must be uint8",
         )
-    if any(tensor.dtype != torch.float32 for tensor in scales):
+    if any(tensor.dtype not in (torch.float32, torch.bfloat16) for tensor in scales):
         raise Phase4UnsupportedError(
             Phase4FailureCategory.VALIDATION,
-            "WNA16 scales must be float32",
+            "WNA16 scales must be float32 or bfloat16",
         )
     if any(
         tensor.ndim != 3 or tensor.shape[0] != bundle.slot_count for tensor in tensors
@@ -1243,11 +1243,6 @@ def validate_wna16_generation_view(
         raise Phase4UnsupportedError(
             Phase4FailureCategory.VALIDATION,
             "packed WNA16 dimensions must be positive",
-        )
-    if w13_rows != 2 * w2_rows:
-        raise Phase4UnsupportedError(
-            Phase4FailureCategory.VALIDATION,
-            "w13 rows must be twice the w2 rows",
         )
     w13_input = w13_packed_cols * packing_factor
     w2_input = w2_packed_cols * packing_factor

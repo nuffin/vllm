@@ -4246,6 +4246,39 @@ def test_pre_publication_failure_rolls_back_and_restores_old_publication():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")
+def test_wna16_view_validation_accepts_bfloat16_scale_operands():
+    """Real Qwen3 WNA16 conversions produce bfloat16 group scales."""
+    bundle = WNA16ExpertBundle(
+        schema_version=1,
+        backend="triton",
+        layer_id=3,
+        global_num_experts=4,
+        slot_count=2,
+        generation=9,
+        quant_type="W4A16",
+        num_bits=4,
+        symmetric=True,
+        group_size=32,
+        act_order=False,
+        w13=torch.zeros((2, 64, 16), device="cuda", dtype=torch.uint8),
+        w2=torch.zeros((2, 32, 16), device="cuda", dtype=torch.uint8),
+        w13_scale=torch.ones((2, 64, 1), device="cuda", dtype=torch.bfloat16),
+        w2_scale=torch.ones((2, 32, 1), device="cuda", dtype=torch.bfloat16),
+    )
+    lease = WNA16UseLease(layer_id=3, generation=9, bundle=bundle, token=1)
+    view = WNA16GenerationView(
+        bundle,
+        torch.tensor([0, -1, 1, -1], device="cuda", dtype=torch.int32),
+        9,
+        lease,
+    )
+    capability = _new_controller_wna16_stable_slot_capability()
+    view = _bind_controller_wna16_slot_storage(view, capability)
+    view = _bind_controller_wna16_cuda_map_authority(view, capability)
+    validate_wna16_generation_view(view, layer_id=3)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")
 def test_private_dispatch_validation_accepts_masked_router_ids():
     """Masked id -1 is a no-expert token, not an invalid routed expert."""
     view, _ = cuda_private_view()
